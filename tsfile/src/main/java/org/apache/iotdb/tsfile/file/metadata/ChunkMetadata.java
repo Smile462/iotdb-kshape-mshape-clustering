@@ -174,9 +174,6 @@ public class ChunkMetadata implements IChunkMetadata {
     int byteLen = 0;
     byteLen += ReadWriteIOUtils.write(offsetOfChunkHeader, outputStream);
     if (serializeStatistic) {
-      System.out.println(
-          "[7.5] serializeTo, this.statistics.isChunkStatistics="
-              + this.statistics.isChunkStatistics);
       byteLen += statistics.serialize(outputStream);
     }
     return byteLen;

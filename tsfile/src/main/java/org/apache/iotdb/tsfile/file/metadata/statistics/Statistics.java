@@ -188,11 +188,6 @@ public abstract class Statistics<T extends Serializable> {
     if (!isChunkStatistics) {
       updateStatistics();
     }
-    System.out.println(
-        "[7] serialize, isChunkStatistics="
-            + isChunkStatistics
-            + ", sumMatrices[0][0][0]="
-            + sumMatrices[0][0][0]);
     // System.out.println("========================");
     // System.out.println("k=" + k + ", l=" + l);
     // System.out.println("Start time = " + startTime + ", end time = " + endTime);
@@ -790,10 +785,6 @@ public abstract class Statistics<T extends Serializable> {
         pageStatisticsList.get(pageStatisticsList.size() - 1).tailExtraPoints.clone();
 
     this.isChunkStatistics = true;
-    System.out.println(
-        "updateChunkStatistics: isChunkStatistics set to true, sumMatrices[0][0][0]="
-            + this.sumMatrices[0][0][0]);
-
     this.isEmpty = false;
   }
 

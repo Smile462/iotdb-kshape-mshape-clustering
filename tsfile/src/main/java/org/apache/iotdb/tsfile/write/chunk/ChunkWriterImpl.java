@@ -431,8 +431,6 @@ public class ChunkWriterImpl implements IChunkWriter {
 
     if (!pageStatisticsList.isEmpty()) {
       statistics.updateChunkStatistics(pageStatisticsList);
-      System.out.println(
-          "[1] after updateChunkStatistics, isChunkStatistics=" + statistics.isChunkStatistics);
     }
 
     // start to write this column chunk
@@ -445,8 +443,6 @@ public class ChunkWriterImpl implements IChunkWriter {
         pageBuffer.size(),
         numOfPages,
         0);
-    System.out.println(
-        "[2] after startFlushChunk, isChunkStatistics=" + statistics.isChunkStatistics);
 
     long dataOffset = writer.getPos();
 
