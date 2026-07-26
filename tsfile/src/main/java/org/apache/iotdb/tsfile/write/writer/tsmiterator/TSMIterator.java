@@ -85,12 +85,20 @@ public class TSMIterator {
     Statistics seriesStatistics = Statistics.getStatsByType(dataType);
 
     int chunkMetadataListLength = 0;
-    boolean serializeStatistic = (chunkMetadataList.size() > 1);
+    System.out.println(
+        "[6.5] chunkMetadataList.size="
+            + chunkMetadataList.size()
+            + ", serializeStatistic="
+            + (chunkMetadataList.size() > 1));
+    boolean serializeStatistic = true;
     // flush chunkMetadataList one by one
     for (IChunkMetadata chunkMetadata : chunkMetadataList) {
       if (!chunkMetadata.getDataType().equals(dataType)) {
         continue;
       }
+      System.out.println(
+          "[6] constructOneTimeseriesMetadata, isChunkStatistics="
+              + ((ChunkMetadata) chunkMetadata).getStatistics().isChunkStatistics);
       chunkMetadataListLength += chunkMetadata.serializeTo(publicBAOS, serializeStatistic);
       seriesStatistics.mergeStatistics(chunkMetadata.getStatistics());
     }

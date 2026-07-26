@@ -189,7 +189,7 @@ public abstract class Statistics<T extends Serializable> {
       updateStatistics();
     }
     System.out.println(
-        "serialize called, isChunkStatistics="
+        "[7] serialize, isChunkStatistics="
             + isChunkStatistics
             + ", sumMatrices[0][0][0]="
             + sumMatrices[0][0][0]);

@@ -194,6 +194,11 @@ public class TsFileIOWriter implements AutoCloseable {
     if (currentChunkGroupDeviceId == null || chunkMetadataList.isEmpty()) {
       return;
     }
+    for (ChunkMetadata cm : chunkMetadataList) {
+      System.out.println(
+          "[5] endChunkGroup, ChunkMetadata.statistics.isChunkStatistics="
+              + cm.getStatistics().isChunkStatistics);
+    }
     chunkGroupMetadataList.add(
         new ChunkGroupMetadata(currentChunkGroupDeviceId, chunkMetadataList));
     currentChunkGroupDeviceId = null;
@@ -235,6 +240,9 @@ public class TsFileIOWriter implements AutoCloseable {
 
     currentChunkMetadata =
         new ChunkMetadata(measurementId, tsDataType, out.getPosition(), statistics);
+    System.out.println(
+        "[3] startFlushChunk, ChunkMetadata.statistics.isChunkStatistics="
+            + currentChunkMetadata.getStatistics().isChunkStatistics);
     currentChunkMetadata.setMask((byte) mask);
 
     ChunkHeader header =
@@ -275,6 +283,9 @@ public class TsFileIOWriter implements AutoCloseable {
       this.currentChunkMetadataSize += currentChunkMetadata.calculateRamSize();
     }
     chunkMetadataCount++;
+    System.out.println(
+        "[4] endCurrentChunk, currentChunkMetadata.statistics.isChunkStatistics="
+            + currentChunkMetadata.getStatistics().isChunkStatistics);
     chunkMetadataList.add(currentChunkMetadata);
     currentChunkMetadata = null;
   }
