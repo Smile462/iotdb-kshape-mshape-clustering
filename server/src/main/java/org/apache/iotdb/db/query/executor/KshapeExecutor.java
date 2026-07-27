@@ -189,16 +189,8 @@ public class KshapeExecutor {
     for (int i = 0; i < k; i++)
       counts[i] = MathUtils.clusterMemberNum(statisticsList.get(0).idx, i);
 
-    System.out.println(
-        "Page #0 sumMatrices[0][0][0]: " + statisticsList.get(0).sumMatrices[0][0][0]);
-    System.out.println("Page #0 centroids[0][0]: " + statisticsList.get(0).centroids[0][0]);
-
     for (int i = 1; i < statisticsList.size(); i++) {
       Statistics curStatistic = statisticsList.get(i);
-
-      System.out.println(
-          "Page #" + i + " sumMatrices[0][0][0]: " + curStatistic.sumMatrices[0][0][0]);
-      System.out.println("Page #" + i + " centroids[0][0]: " + curStatistic.centroids[0][0]);
 
       for (int j = 0; j < curStatistic.centroids.length; j++) {
         // find the nearest centroid
@@ -244,9 +236,6 @@ public class KshapeExecutor {
         }
       }
     }
-
-    System.out.println("Final sumMatrices[0][0][0]: " + sumMatrices[0][0][0]);
-    System.out.println("Final centroids[0][0]: " + centroids[0][0]);
 
     for (int i = 0; i < k; i++) {
       centroids[i] = MathUtils._extractShape(sumMatrices[i], centroids[i]);
@@ -351,17 +340,9 @@ public class KshapeExecutor {
       counts[i] = MathUtils.clusterMemberNum(statisticsList.get(0).idx, i);
     }
 
-    System.out.println("=== Chunk merge start ===");
-    System.out.println("Initial sumMatrices[0][0][0]: " + sumMatrices[0][0][0]);
-    System.out.println("Initial centroids[0][0]: " + centroids[0][0]);
-
     // 2. 遍历剩余所有 Chunk，逐一合并（与 executePageKshape 的合并逻辑完全一致）
     for (int i = 1; i < statisticsList.size(); i++) {
       Statistics curStatistic = statisticsList.get(i);
-
-      System.out.println(
-          "Chunk #" + i + " sumMatrices[0][0][0]: " + curStatistic.sumMatrices[0][0][0]);
-      System.out.println("Chunk #" + i + " centroids[0][0]: " + curStatistic.centroids[0][0]);
 
       // 合并每个聚类中心的信息
       for (int j = 0; j < curStatistic.centroids.length; j++) {
@@ -409,9 +390,6 @@ public class KshapeExecutor {
         }
       }
     }
-
-    System.out.println("Final sumMatrices[0][0][0]: " + sumMatrices[0][0][0]);
-    System.out.println("Final centroids[0][0]: " + centroids[0][0]);
 
     // 3. 提取最终的形状
     for (int i = 0; i < k; i++) {

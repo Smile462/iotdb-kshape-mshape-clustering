@@ -188,10 +188,10 @@ public abstract class Statistics<T extends Serializable> {
     if (!isChunkStatistics) {
       updateStatistics();
     }
-    // System.out.println("========================");
-    // System.out.println("k=" + k + ", l=" + l);
-    // System.out.println("Start time = " + startTime + ", end time = " + endTime);
-    // System.out.println("========================");
+    System.out.println("========================");
+    System.out.println("k=" + k + ", l=" + l);
+    System.out.println("Start time = " + startTime + ", end time = " + endTime);
+    System.out.println("========================");
 
     byteLen += ReadWriteForEncodingUtils.writeUnsignedVarInt(count, outputStream);
     byteLen += ReadWriteIOUtils.write(startTime, outputStream);
@@ -710,11 +710,8 @@ public abstract class Statistics<T extends Serializable> {
     for (int i = 0; i < k; i++) {
       counts[i] = clusterMemberNum(pageStatisticsList.get(0).idx, i);
     }
-    System.out.println(
-        "  Page #0 sumMatrices[0][0][0]: " + pageStatisticsList.get(0).sumMatrices[0][0][0]);
     for (int i = 1; i < pageStatisticsList.size(); i++) {
       Statistics curStat = pageStatisticsList.get(i);
-      System.out.println("  Page #" + i + " sumMatrices[0][0][0]: " + curStat.sumMatrices[0][0][0]);
 
       for (int j = 0; j < curStat.centroids.length; j++) {
         int nearestIdx = findNearestCentroid(curStat.centroids[j], centroids);
@@ -770,7 +767,6 @@ public abstract class Statistics<T extends Serializable> {
         }
       }
     }
-    System.out.println("  => Chunk sumMatrices[0][0][0]: " + sumMatrices[0][0][0]);
     this.sumMatrices = sumMatrices;
     this.deltas = deltas;
 
