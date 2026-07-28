@@ -118,6 +118,7 @@ public class KshapeExecutor {
   protected QueryDataSet executePageKshape(
       PartialPath seriesPath, Set<String> measurements, QueryContext context, Filter timeFilter)
       throws QueryProcessException, StorageEngineException, IOException {
+    long totalStartTime = System.currentTimeMillis();
     TSFileConfig tsFileConfig = TSFileDescriptor.getInstance().getConfig();
 
     k = tsFileConfig.getClusterNum();
@@ -254,13 +255,14 @@ public class KshapeExecutor {
         resultDataSet.putRecord(record);
       }
     }
+    System.out.println("Total time cost: " + (System.currentTimeMillis() - totalStartTime) + "ms");
     return resultDataSet;
   }
 
   protected QueryDataSet executeKshape(
       PartialPath seriesPath, Set<String> measurements, QueryContext context, Filter timeFilter)
       throws QueryProcessException, StorageEngineException, IOException {
-
+    long totalStartTime = System.currentTimeMillis();
     TSFileConfig tsFileConfig = TSFileDescriptor.getInstance().getConfig();
     long initTimeCost, splitTimeCost, mergeTimeCost, startTime;
     startTime = System.currentTimeMillis();
@@ -408,6 +410,7 @@ public class KshapeExecutor {
         resultDataSet.putRecord(record);
       }
     }
+    System.out.println("Total time cost: " + (System.currentTimeMillis() - totalStartTime) + "ms");
     return resultDataSet;
   }
 
