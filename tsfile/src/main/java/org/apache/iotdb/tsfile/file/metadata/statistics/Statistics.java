@@ -784,6 +784,82 @@ public abstract class Statistics<T extends Serializable> {
     this.isEmpty = false;
   }
 
+  // Mshape更新方法
+  public void updateChunkMStatistics(List<Statistics> pageStatisticsList) {
+    if (pageStatisticsList == null || pageStatisticsList.isEmpty()) {
+      return;
+    }
+
+    // 合并时间范围和计数
+    for (Statistics pageStat : pageStatisticsList) {
+      if (pageStat.getStartTime() < this.startTime) this.startTime = pageStat.getStartTime();
+      if (pageStat.getEndTime() > this.endTime) this.endTime = pageStat.getEndTime();
+      this.count += pageStat.getCount();
+    }
+
+    // 取第一个 Page 的 MShape 元数据作为初始值
+    double[][] edCentroids = pageStatisticsList.get(0).edCentroids.clone();
+    int[] edCounts = pageStatisticsList.get(0).edCounts.clone();
+
+    // 逐个合并剩余 Page
+    for (int i = 1; i < pageStatisticsList.size(); i++) {
+      Statistics curStat = pageStatisticsList.get(i);
+
+      for (int j = 0; j < curStat.edCentroids.length; j++) {
+        if (curStat.edCounts[j] == 0) continue;
+        int nearestIdx = findNearestCentroid(curStat.edCentroids[j], edCentroids);
+        if (nearestIdx != -1) {
+          // 加权平均合并 edCentroids
+          for (int u = 0; u < l; u++) {
+            edCentroids[nearestIdx][u] =
+                (edCentroids[nearestIdx][u] * edCounts[nearestIdx]
+                        + curStat.edCentroids[j][u] * curStat.edCounts[j])
+                    / (edCounts[nearestIdx] + curStat.edCounts[j]);
+          }
+          // 累加成员数
+          edCounts[nearestIdx] += curStat.edCounts[j];
+        }
+      }
+
+      // 处理跨 Page 边界的补充点
+      double[] curHeadExtraPoints = curStat.headExtraPoints;
+      boolean complementaryFlag = false;
+      for (double v : curHeadExtraPoints) {
+        if (v != 0) {
+          complementaryFlag = true;
+          break;
+        }
+      }
+      if (complementaryFlag) {
+        double[] merged = new double[l];
+        for (int j = 0; j < l; j++) {
+          merged[j] = curHeadExtraPoints[j] + pageStatisticsList.get(i - 1).tailExtraPoints[j];
+        }
+        merged = zscore(merged);
+        int nearestIdx = findNearestCentroid(merged, edCentroids);
+        if (nearestIdx != -1) {
+          for (int u = 0; u < l; u++) {
+            edCentroids[nearestIdx][u] =
+                (edCentroids[nearestIdx][u] * edCounts[nearestIdx] + merged[u])
+                    / (edCounts[nearestIdx] + 1);
+          }
+          edCounts[nearestIdx] += 1;
+        }
+      }
+    }
+
+    // 保存到 this
+    this.edCentroids = edCentroids;
+    this.edCounts = edCounts;
+
+    // 保存边界点
+    this.headExtraPoints = pageStatisticsList.get(0).headExtraPoints.clone();
+    this.tailExtraPoints =
+        pageStatisticsList.get(pageStatisticsList.size() - 1).tailExtraPoints.clone();
+
+    this.isChunkStatistics = true;
+  }
+
   // 辅助方法
   private int findNearestCentroid(double[] centroid, double[][] centroids) {
     int idx = -1;

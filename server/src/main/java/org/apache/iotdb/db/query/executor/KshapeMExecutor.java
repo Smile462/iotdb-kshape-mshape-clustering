@@ -120,6 +120,7 @@ public class KshapeMExecutor {
   protected QueryDataSet executePageKshapeM(
       PartialPath seriesPath, Set<String> measurements, QueryContext context, Filter timeFilter)
       throws QueryProcessException, StorageEngineException, IOException {
+    long totalStartTime = System.currentTimeMillis();
     TSFileConfig tsFileConfig = TSFileDescriptor.getInstance().getConfig();
 
     k = tsFileConfig.getClusterNum();
@@ -231,6 +232,7 @@ public class KshapeMExecutor {
         }
       }
     }
+
     mergeTimeCost = System.currentTimeMillis() - startTime;
 
     System.out.println("Split time cost: " + splitTimeCost);
@@ -314,6 +316,7 @@ public class KshapeMExecutor {
         resultDataSet.putRecord(record);
       }
     }
+    System.out.println("Total time cost: " + (System.currentTimeMillis() - totalStartTime) + "ms");
     return resultDataSet;
   }
 
@@ -321,8 +324,9 @@ public class KshapeMExecutor {
       PartialPath seriesPath, Set<String> measurements, QueryContext context, Filter timeFilter)
       throws QueryProcessException, StorageEngineException, IOException {
 
+    long totalStartTime = System.currentTimeMillis();
     TSFileConfig tsFileConfig = TSFileDescriptor.getInstance().getConfig();
-    long startTime = System.currentTimeMillis();
+    long startTime;
 
     k = tsFileConfig.getClusterNum();
     l = tsFileConfig.getSeqLength();
@@ -330,59 +334,29 @@ public class KshapeMExecutor {
         "k: " + k + ", l: " + l + ", cur_page_size: " + tsFileConfig.getMaxNumberOfPointsInPage());
 
     TSDataType tsDataType = dataTypes.get(0);
-    // construct series reader without value filter
+
     QueryDataSource queryDataSource =
         QueryResourceManager.getInstance()
             .getQueryDataSource(seriesPath, context, timeFilter, ascending);
-    // update filter by TTL
     timeFilter = queryDataSource.updateFilterUsingTTL(timeFilter);
 
-    // manually update time filter
-    int startTimeBound = MathUtils.extractTimeBound(timeFilter)[0];
-    int endTimeBound = MathUtils.extractTimeBound(timeFilter)[1];
+    int startTimeBound = Integer.MIN_VALUE, endTimeBound = Integer.MAX_VALUE;
+    if (timeFilter != null) {
+      String strTimeFilter = timeFilter.toString().replace(" ", "");
+      strTimeFilter = strTimeFilter.replace("(", "").replace(")", "").replaceAll("time", "");
+      String[] strTimes = strTimeFilter.split("&&");
+      for (String strTime : strTimes) {
+        if (strTime.contains(">=")) startTimeBound = Integer.parseInt(strTime.replaceAll(">=", ""));
+        else if (strTime.contains(">"))
+          startTimeBound = Integer.parseInt(strTime.replaceAll(">", "")) + 1;
+        if (strTime.contains("<=")) endTimeBound = Integer.parseInt(strTime.replaceAll("<=", ""));
+        else if (strTime.contains("<"))
+          endTimeBound = Integer.parseInt(strTime.replaceAll("<", "")) - 1;
+      }
+    }
 
     IAggregateReader seriesReader =
         new SeriesAggregateReader(
-            seriesPath, measurements, tsDataType, context, queryDataSource, null, null, null, true);
-
-    // split overlapped pages
-    int cnt = 0, curIndex = 0;
-    List<Statistics> statisticsList = new ArrayList<>();
-    List<Boolean> ifUnseq = new ArrayList<>();
-    List<Long> startTimes = new ArrayList<>();
-    List<Long> endTimes = new ArrayList<>();
-
-    // mark unseq chunks
-    while (seriesReader.hasNextFile()) {
-      while (seriesReader.hasNextChunk()) {
-        cnt += 1;
-        if (seriesReader.canUseCurrentChunkStatistics()) {
-          Statistics chunkStatistic = seriesReader.currentChunkStatistics();
-          statisticsList.add(chunkStatistic);
-          if (chunkStatistic.getStartTime() < startTimeBound
-              && chunkStatistic.getEndTime() >= startTimeBound) ifUnseq.add(true);
-          else if (chunkStatistic.getStartTime() <= endTimeBound
-              && chunkStatistic.getEndTime() > endTimeBound) ifUnseq.add(true);
-          else ifUnseq.add(false);
-          startTimes.add(chunkStatistic.getStartTime());
-          endTimes.add(chunkStatistic.getEndTime());
-          seriesReader.skipCurrentChunk();
-        } else {
-          Statistics chunkStatistic = seriesReader.currentChunkStatistics();
-          statisticsList.add(chunkStatistic);
-          ifUnseq.add(true);
-          startTimes.add(chunkStatistic.getStartTime());
-          endTimes.add(chunkStatistic.getEndTime());
-          seriesReader.skipCurrentChunk();
-        }
-        curIndex++;
-      }
-    }
-    System.out.println("Chunk num:" + cnt);
-
-    // split overlapped pages
-    SeriesReader tmpSeriesReader =
-        new SeriesReader(
             seriesPath,
             measurements,
             tsDataType,
@@ -393,57 +367,39 @@ public class KshapeMExecutor {
             null,
             true);
 
-    curIndex = 0;
-    List<ChunkMetadata> chunkMetadataList = tmpSeriesReader.getAllChunkMetadatas();
-    List<Integer> invalidChunkList = new ArrayList<>();
+    int cnt = 0, curIndex = 0;
+    List<Statistics> statisticsList = new ArrayList<>();
 
-    for (ChunkMetadata chunkMetaData : chunkMetadataList) {
-      if (findPre(statisticsList.get(curIndex).getEndTime()) <= findSuc(startTimeBound)
-          || findSuc(statisticsList.get(curIndex).getStartTime()) >= findPre(endTimeBound)) {
-        invalidChunkList.add(curIndex);
-        curIndex++;
-        continue;
-      }
-      if (!ifUnseq.get(curIndex)) {
-        curIndex++;
-        continue;
-      } else {
-        System.out.println("Split one unseq Chunk.");
-        // get original chunk data loader
-        IBatchDataIterator iter = getBatchData(chunkMetaData).getBatchDataIterator();
-
-        long nextStartTime = -1;
-        if (curIndex + 1 < startTimes.size()) nextStartTime = startTimes.get(curIndex + 1);
-        Statistics newStatistic =
-            updateByIter(
-                iter, statisticsList.get(curIndex), startTimeBound, endTimeBound, nextStartTime);
-        statisticsList.set(curIndex, newStatistic);
-
+    // 直接读取 Chunk 元数据
+    while (seriesReader.hasNextFile()) {
+      while (seriesReader.hasNextChunk()) {
+        cnt += 1;
+        if (seriesReader.canUseCurrentChunkStatistics()) {
+          statisticsList.add(seriesReader.currentChunkStatistics());
+          seriesReader.skipCurrentChunk();
+        } else {
+          statisticsList.add(seriesReader.currentChunkStatistics());
+          seriesReader.skipCurrentChunk();
+        }
         curIndex++;
       }
     }
+    System.out.println("Chunk num:" + curIndex);
 
-    for (int j = invalidChunkList.size() - 1; j >= 0; j--) {
-      statisticsList.remove(invalidChunkList.get(j).intValue());
-      chunkMetadataList.remove(invalidChunkList.get(j).intValue());
-      ifUnseq.remove(invalidChunkList.get(j).intValue());
-      startTimes.remove(invalidChunkList.get(j).intValue());
-      endTimes.remove(invalidChunkList.get(j).intValue());
-    }
-
-    // merge
+    // 全局合并（与 executePageKshapeM 完全一致）
     startTime = System.currentTimeMillis();
-    double[][] edCentroids = statisticsList.get(0).edCentroids.clone();
+    double[][] edCentroids = new double[statisticsList.get(0).edCentroids.length][l];
+    for (int i = 0; i < statisticsList.get(0).edCentroids.length; i++) {
+      edCentroids[i] = statisticsList.get(0).edCentroids[i].clone();
+    }
     double[] edDeltas = statisticsList.get(0).edDeltas.clone();
     int[] edCounts = statisticsList.get(0).edCounts.clone();
 
     for (int i = 1; i < statisticsList.size(); i++) {
       Statistics curStatistic = statisticsList.get(i);
       for (int j = 0; j < curStatistic.edCentroids.length; j++) {
-        // find the nearest centroid
         int nearestIdx = findNearestCentroid(curStatistic.edCentroids[j], edCentroids);
         if (nearestIdx != -1) {
-          // merge the centroid
           for (int u = 0; u < l; u++)
             edCentroids[nearestIdx][u] =
                 (edCentroids[nearestIdx][u] * edCounts[nearestIdx]
@@ -469,26 +425,36 @@ public class KshapeMExecutor {
         merged = MathUtils._zscore(merged);
         int nearestIdx = findNearestCentroid(merged, edCentroids);
         if (nearestIdx != -1) {
-          // merge the centroid
           for (int u = 0; u < l; u++)
             edCentroids[nearestIdx][u] =
                 (edCentroids[nearestIdx][u] * edCounts[nearestIdx] + merged[u])
                     / (edCounts[nearestIdx] + 1);
-          // merge the delta
           edCounts[nearestIdx] += 1;
         }
       }
     }
+
+    // 获取 chunkMetadataList 用于采样
+    SeriesReader tmpSeriesReader =
+        new SeriesReader(
+            seriesPath,
+            measurements,
+            tsDataType,
+            context,
+            queryDataSource,
+            timeFilter,
+            null,
+            null,
+            true);
+    List<ChunkMetadata> chunkMetadataList = tmpSeriesReader.getAllChunkMetadatas();
 
     List<ChunkMetadata> sampledChunks =
         selectRandomChunks(
             chunkMetadataList, (int) Math.ceil(chunkMetadataList.size() * sample_rate));
 
     List<double[]> allSampleSeqs = new ArrayList<>();
-
     for (ChunkMetadata chunkMetadata : sampledChunks) {
       ChunkReader chunkReader = (ChunkReader) getChunkReader(chunkMetadata);
-
       while (chunkReader.hasNextSatisfiedPage()) {
         if (Math.random() < 1 - sample_rate) {
           chunkReader.skipCurrentPage();
@@ -508,18 +474,14 @@ public class KshapeMExecutor {
     }
 
     System.out.println("All sampled seqs num: " + allSampleSeqs.size());
-    System.out.println("Update Time: " + (System.currentTimeMillis() - startTime));
     long evaluateTime = 0;
 
     List<double[]> coreset = new ArrayList<>();
     while (coreset.size() < k) {
       double maxDelta = Double.MIN_VALUE;
       double[] maxSeq = null;
-      // pick seqs from sampledChunks
-
       List<double[]> selectedSeqs;
       if (allSampleSeqs.size() == 0) break;
-
       selectedSeqs =
           selectRandomSeqs(allSampleSeqs, (int) Math.ceil(allSampleSeqs.size() * sample_rate));
       for (double[] sampledSeq : selectedSeqs) {
@@ -546,6 +508,7 @@ public class KshapeMExecutor {
         resultDataSet.putRecord(record);
       }
     }
+    System.out.println("Total time cost: " + (System.currentTimeMillis() - totalStartTime) + "ms");
     return resultDataSet;
   }
 

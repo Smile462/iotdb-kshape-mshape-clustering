@@ -334,8 +334,16 @@ public class KshapeExecutor {
 
     startTime = System.currentTimeMillis();
     // split overlapped pages
-    double[][][] sumMatrices = statisticsList.get(0).sumMatrices.clone();
-    double[][] centroids = statisticsList.get(0).centroids.clone();
+    double[][][] sumMatrices = new double[k][l][l];
+    for (int i = 0; i < k; i++) {
+      for (int j = 0; j < l; j++) {
+        sumMatrices[i][j] = statisticsList.get(0).sumMatrices[i][j].clone();
+      }
+    }
+    double[][] centroids = new double[k][l];
+    for (int i = 0; i < k; i++) {
+      centroids[i] = statisticsList.get(0).centroids[i].clone();
+    }
     double[] deltas = statisticsList.get(0).deltas.clone();
     int[] counts = new int[k];
     for (int i = 0; i < k; i++) {

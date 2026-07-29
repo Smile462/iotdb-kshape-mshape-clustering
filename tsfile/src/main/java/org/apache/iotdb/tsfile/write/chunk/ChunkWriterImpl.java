@@ -431,6 +431,7 @@ public class ChunkWriterImpl implements IChunkWriter {
 
     if (!pageStatisticsList.isEmpty()) {
       statistics.updateChunkStatistics(pageStatisticsList);
+      statistics.updateChunkMStatistics(pageStatisticsList);
     }
 
     // start to write this column chunk
