@@ -31,9 +31,6 @@
             <source>${maven.multiModuleProjectDirectory}/README.md</source>
         </file>
         <file>
-            <source>${maven.multiModuleProjectDirectory}/README_ZH.md</source>
-        </file>
-        <file>
             <source>${maven.multiModuleProjectDirectory}/LICENSE-binary</source>
             <destName>LICENSE</destName>
         </file>
