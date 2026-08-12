@@ -262,25 +262,33 @@ public class KshapeExecutor {
   protected QueryDataSet executeKshape(
       PartialPath seriesPath, Set<String> measurements, QueryContext context, Filter timeFilter)
       throws QueryProcessException, StorageEngineException, IOException {
+
     long totalStartTime = System.currentTimeMillis();
     TSFileConfig tsFileConfig = TSFileDescriptor.getInstance().getConfig();
-    long initTimeCost, splitTimeCost, mergeTimeCost, startTime;
-    startTime = System.currentTimeMillis();
+    long startTime;
 
     k = tsFileConfig.getClusterNum();
     l = tsFileConfig.getSeqLength();
+    double chunkThreshold = tsFileConfig.getChunkOverlapThreshold();
+    double pageThreshold = tsFileConfig.getPageOverlapThreshold();
     System.out.println(
-        "k: " + k + ", l: " + l + ", cur_page_size: " + tsFileConfig.getMaxNumberOfPointsInPage());
+        "k: "
+            + k
+            + ", l: "
+            + l
+            + ", chunkThreshold: "
+            + chunkThreshold
+            + ", pageThreshold: "
+            + pageThreshold);
 
     TSDataType tsDataType = dataTypes.get(0);
-    // construct series reader without value filter
+
     QueryDataSource queryDataSource =
         QueryResourceManager.getInstance()
             .getQueryDataSource(seriesPath, context, timeFilter, ascending);
-    // update filter by TTL
     timeFilter = queryDataSource.updateFilterUsingTTL(timeFilter);
 
-    // manually update time filter
+    // 解析时间边界
     int startTimeBound = Integer.MIN_VALUE, endTimeBound = Integer.MAX_VALUE;
     if (timeFilter != null) {
       String strTimeFilter = timeFilter.toString().replace(" ", "");
@@ -308,32 +316,68 @@ public class KshapeExecutor {
             null,
             true);
 
-    int cnt = 0, curIndex = 0;
     List<Statistics> statisticsList = new ArrayList<>();
-    List<Boolean> ifUnseq = new ArrayList<>();
-    List<Long> startTimes = new ArrayList<>();
-    List<Long> endTimes = new ArrayList<>();
+    int chunkCnt = 0, pageCnt = 0, rawCnt = 0;
 
-    // mark unseq chunks
+    // ========== 自适应粒度选择 ==========
     while (seriesReader.hasNextFile()) {
       while (seriesReader.hasNextChunk()) {
-        cnt += 1;
-        if (seriesReader.canUseCurrentChunkStatistics()) {
-          Statistics chunkStatistic = seriesReader.currentChunkStatistics();
+        Statistics chunkStatistic = seriesReader.currentChunkStatistics();
+
+        double chunkRatio = chunkStatistic.getOverlapRatio(startTimeBound, endTimeBound);
+
+        if (chunkRatio >= chunkThreshold) {
+          // 情况1：Chunk 大部分在范围内 → 直接用 Chunk 元数据
           statisticsList.add(chunkStatistic);
           seriesReader.skipCurrentChunk();
-        } else {
-          Statistics chunkStatistic = seriesReader.currentChunkStatistics();
-          statisticsList.add(chunkStatistic);
-          seriesReader.skipCurrentChunk();
+          chunkCnt++;
+
+        } else if (chunkRatio > 0) {
+          // 情况2：Chunk 部分在范围内 → 下降到 Page 级别
+          boolean hasPageInChunk = false;
+
+          while (seriesReader.hasNextPage()) {
+            Statistics pageStatistic = seriesReader.currentPageStatistics();
+
+            double pageRatio = pageStatistic.getOverlapRatio(startTimeBound, endTimeBound);
+
+            if (pageRatio >= pageThreshold) {
+              // 情况2a：Page 大部分在范围内 → 直接用 Page 元数据
+              statisticsList.add(pageStatistic);
+              seriesReader.skipCurrentPage();
+              pageCnt++;
+              hasPageInChunk = true;
+
+            } else if (pageRatio > 0) {
+              // 情况2b：Page 部分在范围内 → 拆分修正
+              IBatchDataIterator iter = seriesReader.nextPage().getBatchDataIterator();
+              Statistics fixedStatistic =
+                  updateByIter(iter, pageStatistic, startTimeBound, endTimeBound, -1);
+              statisticsList.add(fixedStatistic);
+              rawCnt++;
+              hasPageInChunk = true;
+            }
+            // pageRatio == 0 → 完全不在范围内，跳过
+          }
+
+          if (hasPageInChunk) {
+            seriesReader.skipCurrentChunk();
+          }
         }
-        curIndex++;
+        // chunkRatio == 0 → 完全不在范围内，跳过
       }
     }
-    System.out.println("Chunk num:" + curIndex);
+    System.out.println(
+        "Chunk num: " + chunkCnt + ", Page num: " + pageCnt + ", Raw num: " + rawCnt);
 
+    // 如果没有任何数据，返回空结果
+    if (statisticsList.isEmpty()) {
+      return new ListDataSet(selectedSeries, dataTypes);
+    }
+
+    // ========== 全局合并（与原来完全一致） ==========
     startTime = System.currentTimeMillis();
-    // split overlapped pages
+
     double[][][] sumMatrices = new double[k][l][l];
     for (int i = 0; i < k; i++) {
       for (int j = 0; j < l; j++) {
@@ -350,22 +394,17 @@ public class KshapeExecutor {
       counts[i] = MathUtils.clusterMemberNum(statisticsList.get(0).idx, i);
     }
 
-    // 2. 遍历剩余所有 Chunk，逐一合并（与 executePageKshape 的合并逻辑完全一致）
     for (int i = 1; i < statisticsList.size(); i++) {
       Statistics curStatistic = statisticsList.get(i);
 
-      // 合并每个聚类中心的信息
       for (int j = 0; j < curStatistic.centroids.length; j++) {
-        // 找到最近的中心
         int nearestIdx = findNearestCentroid(curStatistic.centroids[j], centroids);
         if (nearestIdx != -1) {
-          // 合并 sumMatrix
           for (int u = 0; u < l; ++u)
             for (int v = 0; v < l; ++v)
               sumMatrices[nearestIdx][u][v] += curStatistic.sumMatrices[j][u][v];
 
           int curCnt = MathUtils.clusterMemberNum(curStatistic.idx, j);
-          // 更新中心
           for (int u = 0; u < l; ++u)
             centroids[nearestIdx][u] =
                 (centroids[nearestIdx][u] * counts[nearestIdx]
@@ -375,7 +414,6 @@ public class KshapeExecutor {
         }
       }
 
-      // 处理跨 Chunk 边界的补充点
       double[] curHeadExtraPoints = curStatistic.headExtraPoints;
       boolean complementaryFlag = false;
       for (double v : curHeadExtraPoints) {
@@ -395,21 +433,17 @@ public class KshapeExecutor {
         if (nearestIdx != -1) {
           for (int u = 0; u < l; ++u)
             for (int v = 0; v < l; ++v) sumMatrices[nearestIdx][u][v] += merged[u] * merged[v];
-
           counts[nearestIdx] += 1;
         }
       }
     }
 
-    // 3. 提取最终的形状
     for (int i = 0; i < k; i++) {
       centroids[i] = MathUtils._extractShape(sumMatrices[i], centroids[i]);
     }
-    mergeTimeCost = System.currentTimeMillis() - startTime;
-
+    long mergeTimeCost = System.currentTimeMillis() - startTime;
     System.out.println("Merge time cost: " + mergeTimeCost);
 
-    // 4. 组装结果
     ListDataSet resultDataSet = new ListDataSet(selectedSeries, dataTypes);
     for (int i = 0; i < centroids.length; i++) {
       for (int j = 0; j < centroids[0].length; j++) {

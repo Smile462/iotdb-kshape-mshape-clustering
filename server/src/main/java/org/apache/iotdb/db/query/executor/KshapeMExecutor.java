@@ -367,24 +367,69 @@ public class KshapeMExecutor {
             null,
             true);
 
-    int cnt = 0, curIndex = 0;
-    List<Statistics> statisticsList = new ArrayList<>();
+    double chunkThreshold = tsFileConfig.getChunkOverlapThreshold();
+    double pageThreshold = tsFileConfig.getPageOverlapThreshold();
+    System.out.println(
+        "k: "
+            + k
+            + ", l: "
+            + l
+            + ", chunkThreshold: "
+            + chunkThreshold
+            + ", pageThreshold: "
+            + pageThreshold);
 
-    // 直接读取 Chunk 元数据
+    List<Statistics> statisticsList = new ArrayList<>();
+    int chunkCnt = 0, pageCnt = 0, rawCnt = 0;
+
+    // ========== 自适应粒度选择 ==========
     while (seriesReader.hasNextFile()) {
       while (seriesReader.hasNextChunk()) {
-        cnt += 1;
-        if (seriesReader.canUseCurrentChunkStatistics()) {
-          statisticsList.add(seriesReader.currentChunkStatistics());
+        Statistics chunkStatistic = seriesReader.currentChunkStatistics();
+
+        double chunkRatio = chunkStatistic.getOverlapRatio(startTimeBound, endTimeBound);
+
+        if (chunkRatio >= chunkThreshold) {
+          // 情况1：Chunk 大部分在范围内 → 直接用 Chunk 元数据
+          statisticsList.add(chunkStatistic);
           seriesReader.skipCurrentChunk();
-        } else {
-          statisticsList.add(seriesReader.currentChunkStatistics());
-          seriesReader.skipCurrentChunk();
+          chunkCnt++;
+
+        } else if (chunkRatio > 0) {
+          // 情况2：Chunk 部分在范围内 → 下降到 Page 级别
+          boolean hasPageInChunk = false;
+
+          while (seriesReader.hasNextPage()) {
+            Statistics pageStatistic = seriesReader.currentPageStatistics();
+
+            double pageRatio = pageStatistic.getOverlapRatio(startTimeBound, endTimeBound);
+
+            if (pageRatio >= pageThreshold) {
+              // 情况2a：Page 大部分在范围内 → 直接用 Page 元数据
+              statisticsList.add(pageStatistic);
+              seriesReader.skipCurrentPage();
+              pageCnt++;
+              hasPageInChunk = true;
+
+            } else if (pageRatio > 0) {
+              // 情况2b：Page 部分在范围内 → 拆分修正
+              IBatchDataIterator iter = seriesReader.nextPage().getBatchDataIterator();
+              Statistics fixedStatistic =
+                  updateByIter(iter, pageStatistic, startTimeBound, endTimeBound, -1);
+              statisticsList.add(fixedStatistic);
+              rawCnt++;
+              hasPageInChunk = true;
+            }
+          }
+
+          if (hasPageInChunk) {
+            seriesReader.skipCurrentChunk();
+          }
         }
-        curIndex++;
       }
     }
-    System.out.println("Chunk num:" + curIndex);
+    System.out.println(
+        "Chunk num: " + chunkCnt + ", Page num: " + pageCnt + ", Raw num: " + rawCnt);
 
     // 全局合并（与 executePageKshapeM 完全一致）
     startTime = System.currentTimeMillis();

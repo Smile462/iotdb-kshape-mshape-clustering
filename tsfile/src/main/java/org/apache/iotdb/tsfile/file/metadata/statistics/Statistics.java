@@ -925,4 +925,15 @@ public abstract class Statistics<T extends Serializable> {
     for (double v : x) res += v * v;
     return Math.sqrt(res);
   }
+
+  public double getOverlapRatio(long queryStart, long queryEnd) {
+    long overlapStart = Math.max(this.startTime, queryStart);
+    long overlapEnd = Math.min(this.endTime, queryEnd);
+    if (overlapStart > overlapEnd) {
+      return 0.0;
+    }
+    long overlapLength = overlapEnd - overlapStart + 1;
+    long totalLength = this.endTime - this.startTime + 1;
+    return (double) overlapLength / totalLength;
+  }
 }

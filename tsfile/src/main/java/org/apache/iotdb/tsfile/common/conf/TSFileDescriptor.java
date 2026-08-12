@@ -58,6 +58,14 @@ public class TSFileDescriptor {
     Properties properties = loadProperties();
     if (properties != null) {
       overwriteConfigByCustomSettings(properties);
+      if (properties.containsKey("chunk_overlap_threshold")) {
+        conf.setChunkOverlapThreshold(
+            Double.parseDouble(properties.getProperty("chunk_overlap_threshold")));
+      }
+      if (properties.containsKey("page_overlap_threshold")) {
+        conf.setPageOverlapThreshold(
+            Double.parseDouble(properties.getProperty("page_overlap_threshold")));
+      }
     }
   }
 

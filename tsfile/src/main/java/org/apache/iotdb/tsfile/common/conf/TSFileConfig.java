@@ -152,6 +152,9 @@ public class TSFileConfig implements Serializable {
   private int clusterNum = 3;
 
   private int seqLength = 166;
+
+  private double chunkOverlapThreshold = 0.8;
+  private double pageOverlapThreshold = 0.8;
   /** customizedProperties, this should be empty by default. */
   private Properties customizedProperties = new Properties();
 
@@ -451,5 +454,21 @@ public class TSFileConfig implements Serializable {
 
   public int getSeqLength() {
     return this.seqLength;
+  }
+
+  public double getChunkOverlapThreshold() {
+    return chunkOverlapThreshold;
+  }
+
+  public void setChunkOverlapThreshold(double chunkOverlapThreshold) {
+    this.chunkOverlapThreshold = chunkOverlapThreshold;
+  }
+
+  public double getPageOverlapThreshold() {
+    return pageOverlapThreshold;
+  }
+
+  public void setPageOverlapThreshold(double pageOverlapThreshold) {
+    this.pageOverlapThreshold = pageOverlapThreshold;
   }
 }
