@@ -1,6 +1,6 @@
 # In-Database Time Series Clustering on Apache IoTDB
 
-本项目是对 SIGMOD 2025 论文 **《In-Database Time Series Clustering》** 的算法复现与优化扩展。我们在 Apache IoTDB 0.13.3 上成功复现了论文提出的 K-Shape 和 Medoid-Shape 两种数据库内时序聚类算法，并**创新性地扩展了 Chunk（块）级别的聚类功能**，在保证聚类精度的前提下显著提升了大规模时序数据的聚类查询效率。
+本项目是对 SIGMOD 2025 论文 **《In-Database Time Series Clustering》** 的算法复现与优化扩展。我们在 Apache IoTDB 0.13.3 上成功复现了论文提出的 K-Shape 和 Medoid-Shape 两种数据库内时序聚类算法，并**创新性地扩展了 Chunk（块）级别的聚类功能及混合元数据加速**，在保证聚类精度的前提下显著提升了大规模时序数据的聚类查询效率。
 
 ## 快速开始
 
