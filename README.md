@@ -73,6 +73,9 @@ SELECT lsmMShape(s0) FROM root.air.d0;
 
 -- M-Shape Chunk 级别
 SELECT lsmMShape(s0,"level"="chunk") FROM root.air.d0;
+
+-- 范围查询
+SELECT lsmKShape(s0,"level"="chunk") FROM root.ecg.d0 WHERE time >= 0 AND time <= 233333;
 ```
 
 ## 主要贡献
@@ -85,6 +88,7 @@ SELECT lsmMShape(s0,"level"="chunk") FROM root.air.d0;
 
 - 设计并实现 Chunk 级别的元数据生成与查询
 - 利用 Chunk 内 Page 预计算元数据生成 Chunk 级精确元数据
+- 设计实现多层元数据混合加速算法
 - 查询时合并次数从 93 次降至 8 次（Air 数据集）
 
 ### 工程问题解决
