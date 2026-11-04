@@ -67,6 +67,7 @@ public class KshapeMExecutor {
   protected boolean ascending;
   protected QueryContext context;
 
+  private long journalRequestStart;
   private int k, l;
   private double sample_rate = 0.2;
 
@@ -84,6 +85,7 @@ public class KshapeMExecutor {
 
   public QueryDataSet execute(AggregationPlan aggregationPlan)
       throws StorageEngineException, IOException, QueryProcessException {
+    journalRequestStart = System.nanoTime();
     Filter timeFilter = null;
     if (expression != null) {
       timeFilter = ((GlobalTimeExpression) expression).getFilter();
@@ -121,6 +123,7 @@ public class KshapeMExecutor {
       PartialPath seriesPath, Set<String> measurements, QueryContext context, Filter timeFilter)
       throws QueryProcessException, StorageEngineException, IOException {
     long totalStartTime = System.currentTimeMillis();
+    PageSafety pageSafety = new PageSafety(parameters);
     TSFileConfig tsFileConfig = TSFileDescriptor.getInstance().getConfig();
 
     k = tsFileConfig.getClusterNum();
@@ -150,6 +153,21 @@ public class KshapeMExecutor {
     while (seriesReader.hasNextFile()) {
       while (seriesReader.hasNextChunk()) {
         while (seriesReader.hasNextPage()) {
+          if (seriesReader.currentPageStatistics() == null
+              || !seriesReader.canUseCurrentPageStatistics()) {
+            Statistics recovered =
+                pageSafety.readPage(
+                    seriesReader.nextPage().getBatchDataIterator(),
+                    startTimeBound,
+                    endTimeBound,
+                    l);
+            if (recovered != null) {
+              statisticsList.add(recovered);
+              ifUnseq.add(false);
+            }
+            curIndex++;
+            continue;
+          }
           if (findPre(seriesReader.currentPageStatistics().getEndTime()) <= startTimeBound
               || findSuc(seriesReader.currentPageStatistics().getStartTime()) > endTimeBound) {
             curIndex++;
@@ -184,9 +202,10 @@ public class KshapeMExecutor {
     System.out.println("Page num:" + curIndex);
     System.out.println("Filtered Page num:" + statisticsList.size());
 
+    if (statisticsList.isEmpty()) throw new IOException("Page query has no eligible metadata");
     // merge
     startTime = System.currentTimeMillis();
-    double[][] edCentroids = statisticsList.get(0).edCentroids.clone();
+    double[][] edCentroids = statisticsList.get(0).clone().edCentroids;
     double[] edDeltas = statisticsList.get(0).edDeltas.clone();
     int[] edCounts = statisticsList.get(0).edCounts.clone();
 
@@ -279,6 +298,7 @@ public class KshapeMExecutor {
       }
     }
 
+    NonEmptyMedoidCandidates.ensure(allSampleSeqs, chunkMetadataList, l, k);
     long evaluateTime = 0;
 
     List<double[]> coreset = new ArrayList<>();
@@ -317,6 +337,7 @@ public class KshapeMExecutor {
       }
     }
     System.out.println("Total time cost: " + (System.currentTimeMillis() - totalStartTime) + "ms");
+    pageSafety.report(statisticsList, ifUnseq);
     return resultDataSet;
   }
 
@@ -367,8 +388,8 @@ public class KshapeMExecutor {
             null,
             true);
 
-    double chunkThreshold = tsFileConfig.getChunkOverlapThreshold();
-    double pageThreshold = tsFileConfig.getPageOverlapThreshold();
+    double chunkThreshold = Double.parseDouble(parameters.getOrDefault("theta_chunk", "0.8"));
+    double pageThreshold = Double.parseDouble(parameters.getOrDefault("theta_page", "0.8"));
     System.out.println(
         "k: "
             + k
@@ -379,58 +400,11 @@ public class KshapeMExecutor {
             + ", pageThreshold: "
             + pageThreshold);
 
-    List<Statistics> statisticsList = new ArrayList<>();
-    int chunkCnt = 0, pageCnt = 0, rawCnt = 0;
-
-    // ========== 自适应粒度选择 ==========
-    while (seriesReader.hasNextFile()) {
-      while (seriesReader.hasNextChunk()) {
-        Statistics chunkStatistic = seriesReader.currentChunkStatistics();
-
-        double chunkRatio = chunkStatistic.getOverlapRatio(startTimeBound, endTimeBound);
-
-        if (chunkRatio >= chunkThreshold) {
-          // 情况1：Chunk 大部分在范围内 → 直接用 Chunk 元数据
-          statisticsList.add(chunkStatistic);
-          seriesReader.skipCurrentChunk();
-          chunkCnt++;
-
-        } else if (chunkRatio > 0) {
-          // 情况2：Chunk 部分在范围内 → 下降到 Page 级别
-          boolean hasPageInChunk = false;
-
-          while (seriesReader.hasNextPage()) {
-            Statistics pageStatistic = seriesReader.currentPageStatistics();
-
-            double pageRatio = pageStatistic.getOverlapRatio(startTimeBound, endTimeBound);
-
-            if (pageRatio >= pageThreshold) {
-              // 情况2a：Page 大部分在范围内 → 直接用 Page 元数据
-              statisticsList.add(pageStatistic);
-              seriesReader.skipCurrentPage();
-              pageCnt++;
-              hasPageInChunk = true;
-
-            } else if (pageRatio > 0) {
-              // 情况2b：Page 部分在范围内 → 拆分修正
-              IBatchDataIterator iter = seriesReader.nextPage().getBatchDataIterator();
-              Statistics fixedStatistic =
-                  updateByIter(iter, pageStatistic, startTimeBound, endTimeBound, -1);
-              statisticsList.add(fixedStatistic);
-              rawCnt++;
-              hasPageInChunk = true;
-            }
-          }
-
-          if (hasPageInChunk) {
-            seriesReader.skipCurrentChunk();
-          }
-        }
-      }
-    }
-    System.out.println(
-        "Chunk num: " + chunkCnt + ", Page num: " + pageCnt + ", Raw num: " + rawCnt);
-
+    JournalSelection journal = new JournalSelection(parameters, startTimeBound, endTimeBound, l, k);
+    journal.started = journalRequestStart;
+    List<Statistics> statisticsList =
+        journal.select(seriesPath, measurements, tsDataType, context, queryDataSource);
+    if (statisticsList.isEmpty()) throw new IOException("Q has no selected metadata");
     // 全局合并（与 executePageKshapeM 完全一致）
     startTime = System.currentTimeMillis();
     double[][] edCentroids = new double[statisticsList.get(0).edCentroids.length][l];
@@ -443,6 +417,7 @@ public class KshapeMExecutor {
     for (int i = 1; i < statisticsList.size(); i++) {
       Statistics curStatistic = statisticsList.get(i);
       for (int j = 0; j < curStatistic.edCentroids.length; j++) {
+        if (curStatistic.edCounts[j] == 0) continue;
         int nearestIdx = findNearestCentroid(curStatistic.edCentroids[j], edCentroids);
         if (nearestIdx != -1) {
           for (int u = 0; u < l; u++)
@@ -454,19 +429,8 @@ public class KshapeMExecutor {
         }
       }
 
-      double[] curHeadExtraPoints = curStatistic.headExtraPoints;
-      boolean complementaryFlag = false;
-      for (double v : curHeadExtraPoints)
-        if (v != 0) {
-          complementaryFlag = true;
-          break;
-        }
-
-      if (complementaryFlag) {
-        double[] merged = new double[l];
-        for (int j = 0; j < l; j++) {
-          merged[j] = curHeadExtraPoints[j] + statisticsList.get(i - 1).tailExtraPoints[j];
-        }
+      double[] merged = JournalSelection.boundarySequence(statisticsList, i, l);
+      if (merged != null) {
         merged = MathUtils._zscore(merged);
         int nearestIdx = findNearestCentroid(merged, edCentroids);
         if (nearestIdx != -1) {
@@ -491,6 +455,7 @@ public class KshapeMExecutor {
             null,
             null,
             true);
+    long journalCandidateStart = System.nanoTime();
     List<ChunkMetadata> chunkMetadataList = tmpSeriesReader.getAllChunkMetadatas();
 
     List<ChunkMetadata> sampledChunks =
@@ -506,6 +471,8 @@ public class KshapeMExecutor {
           continue;
         }
         BatchData batchData = chunkReader.nextPageData();
+        journal.raw += batchData.length();
+        journal.candidateRaw += batchData.length();
         for (int i = (int) (Math.ceil(batchData.getMinTimestamp() * 1.0 / l));
             i < Math.floor(batchData.getMaxTimestamp() * 1.0 / l);
             i++) {
@@ -514,16 +481,21 @@ public class KshapeMExecutor {
             _seq[j] = batchData.getDoubleByIndex((int) (i * l + j - batchData.getMinTimestamp()));
           }
           allSampleSeqs.add(_seq);
+          journal.candidateCount++;
+          journal.candidateHash = (journal.candidateHash ^ i) * 0x100000001b3L;
         }
       }
     }
 
     System.out.println("All sampled seqs num: " + allSampleSeqs.size());
+    NonEmptyMedoidCandidates.ensure(allSampleSeqs, chunkMetadataList, l, k);
+    journal.candidateCount = allSampleSeqs.size();
+    journal.candidateNanos = System.nanoTime() - journalCandidateStart;
     long evaluateTime = 0;
 
     List<double[]> coreset = new ArrayList<>();
     while (coreset.size() < k) {
-      double maxDelta = Double.MIN_VALUE;
+      double maxDelta = -Double.MAX_VALUE;
       double[] maxSeq = null;
       List<double[]> selectedSeqs;
       if (allSampleSeqs.size() == 0) break;
@@ -554,6 +526,7 @@ public class KshapeMExecutor {
       }
     }
     System.out.println("Total time cost: " + (System.currentTimeMillis() - totalStartTime) + "ms");
+    journal.report();
     return resultDataSet;
   }
 

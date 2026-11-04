@@ -59,11 +59,12 @@ public class MathUtils {
     p = Matrix.identity(l, l).minus(p);
     Matrix m = p.times(s).times(p);
 
-    EigenvalueDecomposition E = new EigenvalueDecomposition(m);
+    EigenvalueDecomposition E =
+        org.apache.iotdb.tsfile.file.metadata.statistics.util.KShapeEigenGuard.decompose(m);
     Matrix eigenVectors = E.getV();
     double[] eigenValues = E.getRealEigenvalues();
     int _maxIdx = -1;
-    double _maxVal = Double.MIN_VALUE;
+    double _maxVal = -Double.MAX_VALUE;
     for (int i = 0; i < l; ++i) {
       if (eigenValues[i] > _maxVal) {
         _maxVal = eigenValues[i];
@@ -99,7 +100,7 @@ public class MathUtils {
     for (double v : _ncc(x1, x2)) {
       if (v > _maxv) _maxv = v;
     }
-    return 1 - _maxv / _norm(x1) / _norm(x2);
+    return _norm(x1) * _norm(x2) < 1e-12 ? 1 : 1 - _maxv / _norm(x1) / _norm(x2);
   }
 
   public static double[] _ncc(double[] x1, double[] x2) {
@@ -141,12 +142,13 @@ public class MathUtils {
 
     double[] res = new double[l];
     for (int j = 0; j < l; j++) {
-      res[j] = (X[j] - mean) / std;
+      res[j] = (std < 1e-12 ? 0 : (X[j] - mean) / std);
     }
     return res;
   }
 
   public static int clusterMemberNum(int[] idx, int label) {
+    if (idx[0] == Integer.MIN_VALUE) return idx[label + 1];
     int cnt = 0;
     for (int id : idx) {
       if (id == label) cnt++;

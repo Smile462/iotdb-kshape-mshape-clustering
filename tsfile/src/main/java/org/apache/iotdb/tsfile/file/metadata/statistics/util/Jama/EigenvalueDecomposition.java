@@ -592,6 +592,8 @@ public class EigenvalueDecomposition implements java.io.Serializable {
         }
 
         iter = iter + 1; // (Could check iteration count here.)
+        org.apache.iotdb.tsfile.file.metadata.statistics.util.KShapeEigenGuard.checkIterations(
+            iter);
 
         // Look for two consecutive small sub-diagonal elements
 

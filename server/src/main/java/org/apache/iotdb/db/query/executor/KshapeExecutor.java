@@ -66,6 +66,7 @@ public class KshapeExecutor {
   protected boolean ascending;
   protected QueryContext context;
 
+  private long journalRequestStart;
   private int k = 3, l = 100;
 
   protected KshapeExecutor(QueryContext context, AggregationPlan aggregationPlan) {
@@ -82,6 +83,7 @@ public class KshapeExecutor {
 
   public QueryDataSet execute(AggregationPlan aggregationPlan)
       throws StorageEngineException, IOException, QueryProcessException {
+    journalRequestStart = System.nanoTime();
     Filter timeFilter = null;
     if (expression != null) {
       timeFilter = ((GlobalTimeExpression) expression).getFilter();
@@ -119,6 +121,7 @@ public class KshapeExecutor {
       PartialPath seriesPath, Set<String> measurements, QueryContext context, Filter timeFilter)
       throws QueryProcessException, StorageEngineException, IOException {
     long totalStartTime = System.currentTimeMillis();
+    PageSafety pageSafety = new PageSafety(parameters);
     TSFileConfig tsFileConfig = TSFileDescriptor.getInstance().getConfig();
 
     k = tsFileConfig.getClusterNum();
@@ -148,6 +151,21 @@ public class KshapeExecutor {
     while (seriesReader.hasNextFile()) {
       while (seriesReader.hasNextChunk()) {
         while (seriesReader.hasNextPage()) {
+          if (seriesReader.currentPageStatistics() == null
+              || !seriesReader.canUseCurrentPageStatistics()) {
+            Statistics recovered =
+                pageSafety.readPage(
+                    seriesReader.nextPage().getBatchDataIterator(),
+                    startTimeBound,
+                    endTimeBound,
+                    l);
+            if (recovered != null) {
+              statisticsList.add(recovered);
+              ifUnseq.add(false);
+            }
+            curIndex++;
+            continue;
+          }
           if (findPre(seriesReader.currentPageStatistics().getEndTime()) <= startTimeBound
               || findSuc(seriesReader.currentPageStatistics().getStartTime()) > endTimeBound) {
             curIndex++;
@@ -181,10 +199,11 @@ public class KshapeExecutor {
     System.out.println("Page num:" + curIndex);
     System.out.println("Filtered Page num:" + statisticsList.size());
 
+    if (statisticsList.isEmpty()) throw new IOException("Page query has no eligible metadata");
     // merge
     startTime = System.currentTimeMillis();
-    double[][][] sumMatrices = statisticsList.get(0).sumMatrices.clone();
-    double[][] centroids = statisticsList.get(0).centroids.clone();
+    double[][][] sumMatrices = statisticsList.get(0).clone().sumMatrices;
+    double[][] centroids = statisticsList.get(0).clone().centroids;
     double[] deltas = statisticsList.get(0).deltas.clone();
     int[] counts = new int[k];
     for (int i = 0; i < k; i++)
@@ -256,6 +275,7 @@ public class KshapeExecutor {
       }
     }
     System.out.println("Total time cost: " + (System.currentTimeMillis() - totalStartTime) + "ms");
+    pageSafety.report(statisticsList, ifUnseq);
     return resultDataSet;
   }
 
@@ -269,8 +289,8 @@ public class KshapeExecutor {
 
     k = tsFileConfig.getClusterNum();
     l = tsFileConfig.getSeqLength();
-    double chunkThreshold = tsFileConfig.getChunkOverlapThreshold();
-    double pageThreshold = tsFileConfig.getPageOverlapThreshold();
+    double chunkThreshold = Double.parseDouble(parameters.getOrDefault("theta_chunk", "0.8"));
+    double pageThreshold = Double.parseDouble(parameters.getOrDefault("theta_page", "0.8"));
     System.out.println(
         "k: "
             + k
@@ -316,65 +336,11 @@ public class KshapeExecutor {
             null,
             true);
 
-    List<Statistics> statisticsList = new ArrayList<>();
-    int chunkCnt = 0, pageCnt = 0, rawCnt = 0;
-
-    // ========== 自适应粒度选择 ==========
-    while (seriesReader.hasNextFile()) {
-      while (seriesReader.hasNextChunk()) {
-        Statistics chunkStatistic = seriesReader.currentChunkStatistics();
-
-        double chunkRatio = chunkStatistic.getOverlapRatio(startTimeBound, endTimeBound);
-
-        if (chunkRatio >= chunkThreshold) {
-          // 情况1：Chunk 大部分在范围内 → 直接用 Chunk 元数据
-          statisticsList.add(chunkStatistic);
-          seriesReader.skipCurrentChunk();
-          chunkCnt++;
-
-        } else if (chunkRatio > 0) {
-          // 情况2：Chunk 部分在范围内 → 下降到 Page 级别
-          boolean hasPageInChunk = false;
-
-          while (seriesReader.hasNextPage()) {
-            Statistics pageStatistic = seriesReader.currentPageStatistics();
-
-            double pageRatio = pageStatistic.getOverlapRatio(startTimeBound, endTimeBound);
-
-            if (pageRatio >= pageThreshold) {
-              // 情况2a：Page 大部分在范围内 → 直接用 Page 元数据
-              statisticsList.add(pageStatistic);
-              seriesReader.skipCurrentPage();
-              pageCnt++;
-              hasPageInChunk = true;
-
-            } else if (pageRatio > 0) {
-              // 情况2b：Page 部分在范围内 → 拆分修正
-              IBatchDataIterator iter = seriesReader.nextPage().getBatchDataIterator();
-              Statistics fixedStatistic =
-                  updateByIter(iter, pageStatistic, startTimeBound, endTimeBound, -1);
-              statisticsList.add(fixedStatistic);
-              rawCnt++;
-              hasPageInChunk = true;
-            }
-            // pageRatio == 0 → 完全不在范围内，跳过
-          }
-
-          if (hasPageInChunk) {
-            seriesReader.skipCurrentChunk();
-          }
-        }
-        // chunkRatio == 0 → 完全不在范围内，跳过
-      }
-    }
-    System.out.println(
-        "Chunk num: " + chunkCnt + ", Page num: " + pageCnt + ", Raw num: " + rawCnt);
-
-    // 如果没有任何数据，返回空结果
-    if (statisticsList.isEmpty()) {
-      return new ListDataSet(selectedSeries, dataTypes);
-    }
-
+    JournalSelection journal = new JournalSelection(parameters, startTimeBound, endTimeBound, l, k);
+    journal.started = journalRequestStart;
+    List<Statistics> statisticsList =
+        journal.select(seriesPath, measurements, tsDataType, context, queryDataSource);
+    if (statisticsList.isEmpty()) throw new IOException("Q has no selected metadata");
     // ========== 全局合并（与原来完全一致） ==========
     startTime = System.currentTimeMillis();
 
@@ -398,6 +364,7 @@ public class KshapeExecutor {
       Statistics curStatistic = statisticsList.get(i);
 
       for (int j = 0; j < curStatistic.centroids.length; j++) {
+        if (MathUtils.clusterMemberNum(curStatistic.idx, j) == 0) continue;
         int nearestIdx = findNearestCentroid(curStatistic.centroids[j], centroids);
         if (nearestIdx != -1) {
           for (int u = 0; u < l; ++u)
@@ -414,20 +381,8 @@ public class KshapeExecutor {
         }
       }
 
-      double[] curHeadExtraPoints = curStatistic.headExtraPoints;
-      boolean complementaryFlag = false;
-      for (double v : curHeadExtraPoints) {
-        if (v != 0) {
-          complementaryFlag = true;
-          break;
-        }
-      }
-
-      if (complementaryFlag) {
-        double[] merged = new double[l];
-        for (int j = 0; j < l; j++) {
-          merged[j] = curHeadExtraPoints[j] + statisticsList.get(i - 1).tailExtraPoints[j];
-        }
+      double[] merged = JournalSelection.boundarySequence(statisticsList, i, l);
+      if (merged != null) {
         merged = MathUtils._zscore(merged);
         int nearestIdx = findNearestCentroid(merged, centroids);
         if (nearestIdx != -1) {
@@ -453,6 +408,7 @@ public class KshapeExecutor {
       }
     }
     System.out.println("Total time cost: " + (System.currentTimeMillis() - totalStartTime) + "ms");
+    journal.report();
     return resultDataSet;
   }
 

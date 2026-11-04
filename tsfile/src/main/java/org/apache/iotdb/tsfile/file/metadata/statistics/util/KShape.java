@@ -129,11 +129,11 @@ public class KShape {
     p = Matrix.identity(l, l).minus(p);
     Matrix m = p.times(s).times(p);
 
-    EigenvalueDecomposition E = new EigenvalueDecomposition(m);
+    EigenvalueDecomposition E = KShapeEigenGuard.decompose(m);
     Matrix eigenVectors = E.getV();
     double[] eigenValues = E.getRealEigenvalues();
     int _maxIdx = -1;
-    double _maxVal = Double.MIN_VALUE;
+    double _maxVal = -Double.MAX_VALUE;
     for (int i = 0; i < eigenValues.length; ++i) {
       if (eigenValues[i] > _maxVal) {
         _maxVal = eigenValues[i];
@@ -201,7 +201,7 @@ public class KShape {
 
     double[] res = new double[l];
     for (int j = 0; j < l; j++) {
-      res[j] = (X[j] - mean) / std;
+      res[j] = (std < 1e-12 ? 0 : (X[j] - mean) / std);
     }
     return res;
   }

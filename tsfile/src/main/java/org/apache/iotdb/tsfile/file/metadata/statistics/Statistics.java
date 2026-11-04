@@ -78,6 +78,7 @@ public abstract class Statistics<T extends Serializable> {
   public double[][][] sumMatrices = new double[k][l][l];
   public double[][] centroids = new double[k][l];
   public double[] deltas = new double[k];
+  public boolean journalGridFragments = false;
   public int[] idx = new int[1000];
   public double[] headExtraPoints = new double[l];
   public double[] tailExtraPoints = new double[l];
@@ -139,6 +140,11 @@ public abstract class Statistics<T extends Serializable> {
     for (int i = 0; i < edK; i++) newInstance.setEdDelta(this.edDeltas[i], i);
     for (int i = 0; i < edK; i++) newInstance.setEdCounts(this.edCounts[i], i);
     for (int i = 0; i < 1000; i++) newInstance.setEdIdx(this.edIdx[i], i);
+    newInstance.journalGridFragments = this.journalGridFragments;
+    newInstance.isEmpty = this.isEmpty;
+    newInstance.isChunkStatistics = this.isChunkStatistics;
+    newInstance.journalPageAlias = this.journalPageAlias;
+    newInstance.journalStoredPayload = this.journalStoredPayload;
     return newInstance;
   }
 
@@ -165,9 +171,22 @@ public abstract class Statistics<T extends Serializable> {
 
   public abstract TSDataType getType();
 
+  public Boolean journalStoredPayload = null;
+  public boolean journalPageAlias = false;
+
+  public boolean journalPayload() {
+    if (journalStoredPayload != null) return journalStoredPayload;
+    return !"S0".equals(System.getProperty("journal.storage_state", "SH"))
+        && !(isChunkStatistics
+            && !journalPageAlias
+            && "SP".equals(System.getProperty("journal.storage_state", "SH")));
+  }
+
   public int getSerializedSize() {
+    if (!journalPayload())
+      return ReadWriteForEncodingUtils.uVarIntSize(count) + 17 + getStatsSize();
     return ReadWriteForEncodingUtils.uVarIntSize(count) // count
-        + 16 // startTime, endTime
+        + 17 // startTime, endTime, journal payload marker
         + 8 * k * l * l // sumMatrices
         + 8 * k * l // centroids
         + 8 * k // deltas
@@ -185,7 +204,7 @@ public abstract class Statistics<T extends Serializable> {
   public int serialize(OutputStream outputStream) throws IOException {
     int byteLen = 0;
 
-    if (!isChunkStatistics) {
+    if (!isChunkStatistics && journalPayload()) {
       updateStatistics();
     }
     System.out.println("========================");
@@ -196,6 +215,11 @@ public abstract class Statistics<T extends Serializable> {
     byteLen += ReadWriteForEncodingUtils.writeUnsignedVarInt(count, outputStream);
     byteLen += ReadWriteIOUtils.write(startTime, outputStream);
     byteLen += ReadWriteIOUtils.write(endTime, outputStream);
+    byteLen += ReadWriteIOUtils.write(journalPayload(), outputStream);
+    if (!journalPayload()) {
+      byteLen += serializeStats(outputStream);
+      return byteLen;
+    }
 
     for (int i = 0; i < k; i++) {
       double[][] _matrix = sumMatrices[i];
@@ -251,6 +275,9 @@ public abstract class Statistics<T extends Serializable> {
   public void mergeStatistics(Statistics<? extends Serializable> stats) {
     if (this.getClass() == stats.getClass()) {
       if (!stats.isEmpty) {
+        this.isChunkStatistics = stats.isChunkStatistics;
+        this.journalPageAlias = stats.journalPageAlias;
+        this.journalStoredPayload = stats.journalStoredPayload;
         this.timeWindow = stats.timeWindow;
         this.valueWindow = stats.valueWindow;
 
@@ -445,6 +472,13 @@ public abstract class Statistics<T extends Serializable> {
     statistics.setCount(ReadWriteForEncodingUtils.readUnsignedVarInt(inputStream));
     statistics.setStartTime(ReadWriteIOUtils.readLong(inputStream));
     statistics.setEndTime(ReadWriteIOUtils.readLong(inputStream));
+    boolean journalPayload = ReadWriteIOUtils.readBool(inputStream);
+    statistics.journalStoredPayload = journalPayload;
+    if (!journalPayload) {
+      statistics.deserialize(inputStream);
+      statistics.isEmpty = false;
+      return statistics;
+    }
     // metadata for K-Shape
     for (int i = 0; i < k; i++)
       for (int j = 0; j < l; j++)
@@ -480,6 +514,13 @@ public abstract class Statistics<T extends Serializable> {
     statistics.setCount(ReadWriteForEncodingUtils.readUnsignedVarInt(buffer));
     statistics.setStartTime(ReadWriteIOUtils.readLong(buffer));
     statistics.setEndTime(ReadWriteIOUtils.readLong(buffer));
+    boolean journalPayload = ReadWriteIOUtils.readBool(buffer);
+    statistics.journalStoredPayload = journalPayload;
+    if (!journalPayload) {
+      statistics.deserialize(buffer);
+      statistics.isEmpty = false;
+      return statistics;
+    }
     // metadata for K-Shape
     for (int i = 0; i < k; i++)
       for (int j = 0; j < l; j++)
@@ -594,63 +635,68 @@ public abstract class Statistics<T extends Serializable> {
   }
 
   public void updateStatistics() {
-    if (this.timeWindow.size() < l) {
-      return;
-    }
-    int n = this.timeWindow.size(); // all points
+    if ("S0".equals(System.getProperty("journal.storage_state", "SH"))) return;
+    long journalBegin = System.nanoTime();
+    try {
 
-    long seqStartTime = (long) (Math.ceil(this.startTime * 1.0 / l) * l);
-    long seqEndTime = (long) (Math.floor(this.endTime * 1.0 / l) * l);
-    Arrays.fill(this.idx, -1);
+      int n = this.timeWindow.size(); // all points
 
-    List<List<Double>> tmpSeqs = new ArrayList<>();
-    List<Double> tmpSeq = new ArrayList<>();
-    int _i = 0;
-    while (_i < n) {
-      if (this.timeWindow.get(_i) < seqStartTime) {
-        this.headExtraPoints[_i] = this.valueWindow.get(_i);
+      long seqStartTime = (long) (Math.ceil(this.startTime * 1.0 / l) * l);
+      long seqEndTime = (long) (Math.floor(this.endTime * 1.0 / l) * l);
+      Arrays.fill(this.idx, -1);
+
+      List<List<Double>> tmpSeqs = new ArrayList<>();
+      List<Double> tmpSeq = new ArrayList<>();
+      int _i = 0;
+      while (_i < n) {
+        if (this.timeWindow.get(_i) < seqStartTime) {
+          this.headExtraPoints[_i] = this.valueWindow.get(_i);
+          _i++;
+          continue;
+        }
+        tmpSeq.add(this.valueWindow.get(_i));
+        if (tmpSeq.size() == l) {
+          tmpSeqs.add(tmpSeq);
+          tmpSeq = new ArrayList<>();
+        }
         _i++;
-        continue;
       }
-      tmpSeq.add(this.valueWindow.get(_i));
-      if (tmpSeq.size() == l) {
-        tmpSeqs.add(tmpSeq);
-        tmpSeq = new ArrayList<>();
+      if (tmpSeq.size() > 0)
+        for (int i = 0; i < tmpSeq.size(); i++)
+          this.tailExtraPoints[l - tmpSeq.size() + i] = tmpSeq.get(i);
+
+      double[][] X = new double[tmpSeqs.size()][l];
+      for (int i = 0; i < tmpSeqs.size(); i++) {
+        X[i] = tmpSeqs.get(i).stream().mapToDouble(Double::doubleValue).toArray();
+        X[i] = normalize(X[i]);
       }
-      _i++;
-    }
-    if (tmpSeq.size() > 0)
-      for (int i = 0; i < tmpSeq.size(); i++)
-        this.tailExtraPoints[l - tmpSeq.size() + i] = tmpSeq.get(i);
 
-    double[][] X = new double[tmpSeqs.size()][l];
-    for (int i = 0; i < tmpSeqs.size(); i++) {
-      X[i] = tmpSeqs.get(i).stream().mapToDouble(Double::doubleValue).toArray();
-      X[i] = normalize(X[i]);
-    }
+      if (X.length == 0) return;
+      int seqNum = X.length;
+      int l = X[0].length;
 
-    int seqNum = X.length;
-    int l = X[0].length;
+      // pre-compute metadata for K-Shape
+      KShape kshape = new KShape(k, 30);
+      kshape.fit(X);
+      for (int i = 0; i < k; i++)
+        this.sumMatrices[i] = kshape.getSumMatrices()[i].getArray(); // k * l * l
+      this.centroids = kshape.getCentroids(); // k * l
+      this.deltas = kshape.getDeltas(); // k
+      for (int i = 0; i < kshape.getIdx().length; i++) this.idx[i] = kshape.getIdx()[i];
 
-    // pre-compute metadata for K-Shape
-    KShape kshape = new KShape(k, 30);
-    kshape.fit(X);
-    for (int i = 0; i < k; i++)
-      this.sumMatrices[i] = kshape.getSumMatrices()[i].getArray(); // k * l * l
-    this.centroids = kshape.getCentroids(); // k * l
-    this.deltas = kshape.getDeltas(); // k
-    for (int i = 0; i < kshape.getIdx().length; i++) this.idx[i] = kshape.getIdx()[i];
-
-    // pre-compute metadata for K-Shape-M
-    Arrays.fill(this.edIdx, -1);
-    Arrays.fill(this.edCounts, 0);
-    KMeans clustering = new KMeans.Builder(edK, X).iterations(30).ifPlusInitial(true).build();
-    this.edCentroids = clustering.getCentroids();
-    this.edDeltas = clustering.getDeltas();
-    for (int i = 0; i < clustering.getIdx().length; i++) this.edIdx[i] = clustering.getIdx()[i];
-    for (int idx : this.edIdx) {
-      if (idx == -1) break;
-      this.edCounts[idx]++;
+      // pre-compute metadata for K-Shape-M
+      Arrays.fill(this.edIdx, -1);
+      Arrays.fill(this.edCounts, 0);
+      KMeans clustering = new KMeans.Builder(edK, X).iterations(30).ifPlusInitial(true).build();
+      this.edCentroids = clustering.getCentroids();
+      this.edDeltas = clustering.getDeltas();
+      for (int i = 0; i < clustering.getIdx().length; i++) this.edIdx[i] = clustering.getIdx()[i];
+      for (int idx : this.edIdx) {
+        if (idx == -1) break;
+        this.edCounts[idx]++;
+      }
+    } finally {
+      System.out.println("JOURNAL_BUILD_PAGE_NS=" + (System.nanoTime() - journalBegin));
     }
   }
 
@@ -678,7 +724,8 @@ public abstract class Statistics<T extends Serializable> {
     for (double v : x) std += (v - mean) * (v - mean);
     std = Math.sqrt(std / (x.length - 1));
     double[] res = new double[x.length];
-    for (int i = 0; i < x.length; i++) res[i] = (x[i] - mean) / std;
+    for (int i = 0; i < x.length; i++)
+      res[i] = std < 1e-12 ? 0 : (std < 1e-12 ? 0 : (x[i] - mean) / std);
     return res;
   }
 
@@ -686,178 +733,235 @@ public abstract class Statistics<T extends Serializable> {
    * 为 Chunk 级别生成精确的元数据。 该方法在 Chunk 刷盘时被调用，输入是该 Chunk 内所有 Page 的 Statistics 列表。 它对这些 Page 元数据执行一次完整的
    * KShape 聚类合并，得到 Chunk 级别的精确元数据。
    */
+  public static Statistics journalChunkView(Statistics source) {
+    if (source.journalGridFragments) return source;
+    Statistics view = source.clone();
+    view.idx = source.idx.clone();
+    view.edIdx = source.edIdx.clone();
+    view.headExtraPoints = new double[l];
+    view.tailExtraPoints = new double[l];
+    int offset = (int) (source.getStartTime() % l);
+    int head = offset == 0 ? 0 : (int) Math.min(source.getCount(), l - offset);
+    for (int i = 0; i < head; i++) view.headExtraPoints[offset + i] = source.headExtraPoints[i];
+    int tail = (int) ((source.getEndTime() + 1) % l);
+    if (source.getEndTime() / l >= ((source.getStartTime() + l - 1) / l))
+      for (int i = 0; i < tail; i++) view.tailExtraPoints[i] = source.tailExtraPoints[l - tail + i];
+    view.journalGridFragments = true;
+    return view;
+  }
+
+  private static List<Statistics> journalChunkPages(List<Statistics> pages) {
+    List<Statistics> result = new ArrayList<>();
+    for (Statistics page : pages) result.add(journalChunkView(page));
+    return result;
+  }
+
   public void updateChunkStatistics(List<Statistics> pageStatisticsList) {
-    if (pageStatisticsList == null || pageStatisticsList.isEmpty()) {
-      return;
-    }
+    pageStatisticsList = journalChunkPages(pageStatisticsList);
+    this.journalGridFragments = true;
+    long journalBegin = System.nanoTime();
+    try {
 
-    // 合并时间范围和计数
-    for (Statistics pageStat : pageStatisticsList) {
-      if (pageStat.getStartTime() < this.startTime) {
-        this.startTime = pageStat.getStartTime();
+      if (pageStatisticsList == null || pageStatisticsList.isEmpty()) {
+        return;
       }
-      if (pageStat.getEndTime() > this.endTime) {
-        this.endTime = pageStat.getEndTime();
+
+      // 合并时间范围和计数
+      this.count = 0;
+      for (Statistics pageStat : pageStatisticsList) {
+        if (pageStat.getStartTime() < this.startTime) {
+          this.startTime = pageStat.getStartTime();
+        }
+        if (pageStat.getEndTime() > this.endTime) {
+          this.endTime = pageStat.getEndTime();
+        }
+        this.count += pageStat.getCount();
       }
-      this.count += pageStat.getCount();
-    }
 
-    // 执行与 executePageKshape 完全相同的合并逻辑
-    double[][][] sumMatrices = pageStatisticsList.get(0).sumMatrices.clone();
-    double[][] centroids = pageStatisticsList.get(0).centroids.clone();
-    double[] deltas = pageStatisticsList.get(0).deltas.clone();
-    int[] counts = new int[k];
-    for (int i = 0; i < k; i++) {
-      counts[i] = clusterMemberNum(pageStatisticsList.get(0).idx, i);
-    }
-    for (int i = 1; i < pageStatisticsList.size(); i++) {
-      Statistics curStat = pageStatisticsList.get(i);
+      // 执行与 executePageKshape 完全相同的合并逻辑
+      double[][][] sumMatrices = pageStatisticsList.get(0).clone().sumMatrices;
+      double[][] centroids = pageStatisticsList.get(0).clone().centroids;
+      double[] deltas = pageStatisticsList.get(0).deltas.clone();
+      int[] counts = new int[k];
+      for (int i = 0; i < k; i++) {
+        counts[i] = clusterMemberNum(pageStatisticsList.get(0).idx, i);
+      }
+      for (int i = 1; i < pageStatisticsList.size(); i++) {
+        Statistics curStat = pageStatisticsList.get(i);
 
-      for (int j = 0; j < curStat.centroids.length; j++) {
-        int nearestIdx = findNearestCentroid(curStat.centroids[j], centroids);
-        if (nearestIdx != -1) {
-          for (int u = 0; u < l; ++u) {
-            for (int v = 0; v < l; ++v) {
-              sumMatrices[nearestIdx][u][v] += curStat.sumMatrices[j][u][v];
+        for (int j = 0; j < curStat.centroids.length; j++) {
+          if (clusterMemberNum(curStat.idx, j) == 0) continue;
+          int nearestIdx = findNearestCentroid(curStat.centroids[j], centroids);
+          if (nearestIdx != -1) {
+            for (int u = 0; u < l; ++u) {
+              for (int v = 0; v < l; ++v) {
+                sumMatrices[nearestIdx][u][v] += curStat.sumMatrices[j][u][v];
+              }
             }
-          }
-          int curCnt = clusterMemberNum(curStat.idx, j);
-          for (int u = 0; u < l; ++u) {
-            centroids[nearestIdx][u] =
-                (centroids[nearestIdx][u] * counts[nearestIdx] + curStat.centroids[j][u] * curCnt)
-                    / (counts[nearestIdx] + curCnt);
-          }
-          counts[nearestIdx] += curCnt;
-        }
-      }
-
-      // 处理跨 Page 边界的补充点
-      double[] curHeadExtraPoints = curStat.headExtraPoints;
-      boolean complementaryFlag = false;
-      for (double v : curHeadExtraPoints) {
-        if (v != 0) {
-          complementaryFlag = true;
-          break;
-        }
-      }
-
-      if (complementaryFlag) {
-        double[] merged = new double[l];
-        for (int j = 0; j < l; j++) {
-          merged[j] = curHeadExtraPoints[j] + pageStatisticsList.get(i - 1).tailExtraPoints[j];
-        }
-        merged = zscore(merged);
-        int nearestIdx = findNearestCentroid(merged, centroids);
-        if (nearestIdx != -1) {
-          for (int u = 0; u < l; ++u) {
-            for (int v = 0; v < l; ++v) {
-              sumMatrices[nearestIdx][u][v] += merged[u] * merged[v];
+            int curCnt = clusterMemberNum(curStat.idx, j);
+            for (int u = 0; u < l; ++u) {
+              centroids[nearestIdx][u] =
+                  (centroids[nearestIdx][u] * counts[nearestIdx] + curStat.centroids[j][u] * curCnt)
+                      / (counts[nearestIdx] + curCnt);
             }
+            counts[nearestIdx] += curCnt;
           }
-          counts[nearestIdx] += 1;
+        }
+
+        // 处理跨 Page 边界的补充点
+        double[] curHeadExtraPoints = curStat.headExtraPoints;
+        boolean complementaryFlag = false;
+        for (double v : curHeadExtraPoints) {
+          if (v != 0) {
+            complementaryFlag = true;
+            break;
+          }
+        }
+
+        complementaryFlag =
+            curStat.getStartTime() % l != 0
+                && pageStatisticsList.get(i - 1).getEndTime() + 1 == curStat.getStartTime()
+                && pageStatisticsList.get(i - 1).getStartTime() <= curStat.getStartTime() / l * l
+                && curStat.getEndTime() >= (curStat.getStartTime() / l + 1) * l - 1;
+        if (complementaryFlag) {
+          double[] merged = new double[l];
+          for (int j = 0; j < l; j++) {
+            merged[j] = curHeadExtraPoints[j] + pageStatisticsList.get(i - 1).tailExtraPoints[j];
+          }
+          merged = zscore(merged);
+          int nearestIdx = findNearestCentroid(merged, centroids);
+          if (nearestIdx != -1) {
+            for (int u = 0; u < l; ++u) {
+              for (int v = 0; v < l; ++v) {
+                sumMatrices[nearestIdx][u][v] += merged[u] * merged[v];
+              }
+            }
+            counts[nearestIdx] += 1;
+          }
         }
       }
-    }
 
-    // 提取形状并保存到 this 的字段中
-    for (int i = 0; i < k; i++) {
-      if (counts[i] > 0) {
-        for (int j = 0; j < l; j++) {
-          this.centroids[i][j] = centroids[i][j];
+      // 提取形状并保存到 this 的字段中
+      for (int i = 0; i < k; i++) {
+        if (counts[i] > 0) {
+          for (int j = 0; j < l; j++) {
+            this.centroids[i][j] = centroids[i][j];
+          }
         }
       }
+      Arrays.fill(this.idx, -1);
+      this.idx[0] = Integer.MIN_VALUE;
+      for (int c = 0; c < k; c++) this.idx[c + 1] = counts[c];
+      this.sumMatrices = sumMatrices;
+      this.deltas = deltas;
+
+      // 同时填充 chunkCentroidList
+      this.chunkCentroidList.clear();
+      for (int i = 0; i < k; i++) {
+        this.chunkCentroidList.add(this.centroids[i].clone());
+      }
+
+      this.headExtraPoints = pageStatisticsList.get(0).headExtraPoints.clone();
+      this.tailExtraPoints =
+          pageStatisticsList.get(pageStatisticsList.size() - 1).tailExtraPoints.clone();
+
+      this.isChunkStatistics = true;
+      this.isEmpty = false;
+
+    } finally {
+      System.out.println("JOURNAL_BUILD_CHUNK_K_NS=" + (System.nanoTime() - journalBegin));
     }
-    this.sumMatrices = sumMatrices;
-    this.deltas = deltas;
-
-    // 同时填充 chunkCentroidList
-    this.chunkCentroidList.clear();
-    for (int i = 0; i < k; i++) {
-      this.chunkCentroidList.add(this.centroids[i].clone());
-    }
-
-    this.headExtraPoints = pageStatisticsList.get(0).headExtraPoints.clone();
-    this.tailExtraPoints =
-        pageStatisticsList.get(pageStatisticsList.size() - 1).tailExtraPoints.clone();
-
-    this.isChunkStatistics = true;
-    this.isEmpty = false;
   }
 
   // Mshape更新方法
   public void updateChunkMStatistics(List<Statistics> pageStatisticsList) {
-    if (pageStatisticsList == null || pageStatisticsList.isEmpty()) {
-      return;
-    }
+    pageStatisticsList = journalChunkPages(pageStatisticsList);
+    this.journalGridFragments = true;
+    long journalBegin = System.nanoTime();
+    try {
 
-    // 合并时间范围和计数
-    for (Statistics pageStat : pageStatisticsList) {
-      if (pageStat.getStartTime() < this.startTime) this.startTime = pageStat.getStartTime();
-      if (pageStat.getEndTime() > this.endTime) this.endTime = pageStat.getEndTime();
-      this.count += pageStat.getCount();
-    }
+      if (pageStatisticsList == null || pageStatisticsList.isEmpty()) {
+        return;
+      }
 
-    // 取第一个 Page 的 MShape 元数据作为初始值
-    double[][] edCentroids = pageStatisticsList.get(0).edCentroids.clone();
-    int[] edCounts = pageStatisticsList.get(0).edCounts.clone();
+      // 合并时间范围和计数
+      this.count = 0;
+      for (Statistics pageStat : pageStatisticsList) {
+        if (pageStat.getStartTime() < this.startTime) this.startTime = pageStat.getStartTime();
+        if (pageStat.getEndTime() > this.endTime) this.endTime = pageStat.getEndTime();
+        this.count += pageStat.getCount();
+      }
 
-    // 逐个合并剩余 Page
-    for (int i = 1; i < pageStatisticsList.size(); i++) {
-      Statistics curStat = pageStatisticsList.get(i);
+      // 取第一个 Page 的 MShape 元数据作为初始值
+      double[][] edCentroids = pageStatisticsList.get(0).clone().edCentroids;
+      int[] edCounts = pageStatisticsList.get(0).edCounts.clone();
 
-      for (int j = 0; j < curStat.edCentroids.length; j++) {
-        if (curStat.edCounts[j] == 0) continue;
-        int nearestIdx = findNearestCentroid(curStat.edCentroids[j], edCentroids);
-        if (nearestIdx != -1) {
-          // 加权平均合并 edCentroids
-          for (int u = 0; u < l; u++) {
-            edCentroids[nearestIdx][u] =
-                (edCentroids[nearestIdx][u] * edCounts[nearestIdx]
-                        + curStat.edCentroids[j][u] * curStat.edCounts[j])
-                    / (edCounts[nearestIdx] + curStat.edCounts[j]);
+      // 逐个合并剩余 Page
+      for (int i = 1; i < pageStatisticsList.size(); i++) {
+        Statistics curStat = pageStatisticsList.get(i);
+
+        for (int j = 0; j < curStat.edCentroids.length; j++) {
+          if (curStat.edCounts[j] == 0) continue;
+          int nearestIdx = findNearestCentroid(curStat.edCentroids[j], edCentroids);
+          if (nearestIdx != -1) {
+            // 加权平均合并 edCentroids
+            for (int u = 0; u < l; u++) {
+              edCentroids[nearestIdx][u] =
+                  (edCentroids[nearestIdx][u] * edCounts[nearestIdx]
+                          + curStat.edCentroids[j][u] * curStat.edCounts[j])
+                      / (edCounts[nearestIdx] + curStat.edCounts[j]);
+            }
+            // 累加成员数
+            edCounts[nearestIdx] += curStat.edCounts[j];
           }
-          // 累加成员数
-          edCounts[nearestIdx] += curStat.edCounts[j];
         }
-      }
 
-      // 处理跨 Page 边界的补充点
-      double[] curHeadExtraPoints = curStat.headExtraPoints;
-      boolean complementaryFlag = false;
-      for (double v : curHeadExtraPoints) {
-        if (v != 0) {
-          complementaryFlag = true;
-          break;
-        }
-      }
-      if (complementaryFlag) {
-        double[] merged = new double[l];
-        for (int j = 0; j < l; j++) {
-          merged[j] = curHeadExtraPoints[j] + pageStatisticsList.get(i - 1).tailExtraPoints[j];
-        }
-        merged = zscore(merged);
-        int nearestIdx = findNearestCentroid(merged, edCentroids);
-        if (nearestIdx != -1) {
-          for (int u = 0; u < l; u++) {
-            edCentroids[nearestIdx][u] =
-                (edCentroids[nearestIdx][u] * edCounts[nearestIdx] + merged[u])
-                    / (edCounts[nearestIdx] + 1);
+        // 处理跨 Page 边界的补充点
+        double[] curHeadExtraPoints = curStat.headExtraPoints;
+        boolean complementaryFlag = false;
+        for (double v : curHeadExtraPoints) {
+          if (v != 0) {
+            complementaryFlag = true;
+            break;
           }
-          edCounts[nearestIdx] += 1;
+        }
+        complementaryFlag =
+            curStat.getStartTime() % l != 0
+                && pageStatisticsList.get(i - 1).getEndTime() + 1 == curStat.getStartTime()
+                && pageStatisticsList.get(i - 1).getStartTime() <= curStat.getStartTime() / l * l
+                && curStat.getEndTime() >= (curStat.getStartTime() / l + 1) * l - 1;
+        if (complementaryFlag) {
+          double[] merged = new double[l];
+          for (int j = 0; j < l; j++) {
+            merged[j] = curHeadExtraPoints[j] + pageStatisticsList.get(i - 1).tailExtraPoints[j];
+          }
+          merged = zscore(merged);
+          int nearestIdx = findNearestCentroid(merged, edCentroids);
+          if (nearestIdx != -1) {
+            for (int u = 0; u < l; u++) {
+              edCentroids[nearestIdx][u] =
+                  (edCentroids[nearestIdx][u] * edCounts[nearestIdx] + merged[u])
+                      / (edCounts[nearestIdx] + 1);
+            }
+            edCounts[nearestIdx] += 1;
+          }
         }
       }
+
+      // 保存到 this
+      this.edCentroids = edCentroids;
+      this.edCounts = edCounts;
+
+      // 保存边界点
+      this.headExtraPoints = pageStatisticsList.get(0).headExtraPoints.clone();
+      this.tailExtraPoints =
+          pageStatisticsList.get(pageStatisticsList.size() - 1).tailExtraPoints.clone();
+
+      this.isChunkStatistics = true;
+
+    } finally {
+      System.out.println("JOURNAL_BUILD_CHUNK_M_NS=" + (System.nanoTime() - journalBegin));
     }
-
-    // 保存到 this
-    this.edCentroids = edCentroids;
-    this.edCounts = edCounts;
-
-    // 保存边界点
-    this.headExtraPoints = pageStatisticsList.get(0).headExtraPoints.clone();
-    this.tailExtraPoints =
-        pageStatisticsList.get(pageStatisticsList.size() - 1).tailExtraPoints.clone();
-
-    this.isChunkStatistics = true;
   }
 
   // 辅助方法
@@ -876,6 +980,7 @@ public abstract class Statistics<T extends Serializable> {
 
   /** 统计 idx 数组中值为 cluster 的成员数量。 */
   private int clusterMemberNum(int[] idx, int cluster) {
+    if (idx[0] == Integer.MIN_VALUE) return idx[cluster + 1];
     int count = 0;
     for (int i : idx) {
       if (i == cluster) {
@@ -894,7 +999,8 @@ public abstract class Statistics<T extends Serializable> {
     for (double v : x) std += (v - mean) * (v - mean);
     std = Math.sqrt(std / (x.length - 1));
     double[] res = new double[x.length];
-    for (int i = 0; i < x.length; i++) res[i] = (x[i] - mean) / std;
+    for (int i = 0; i < x.length; i++)
+      res[i] = std < 1e-12 ? 0 : (std < 1e-12 ? 0 : (x[i] - mean) / std);
     return res;
   }
 
@@ -903,7 +1009,7 @@ public abstract class Statistics<T extends Serializable> {
     for (double v : ncc(x, y)) {
       if (v > maxv) maxv = v;
     }
-    return 1 - maxv / norm(x) / norm(y);
+    return norm(x) * norm(y) < 1e-12 ? 1 : 1 - maxv / norm(x) / norm(y);
   }
 
   private double[] ncc(double[] x, double[] y) {

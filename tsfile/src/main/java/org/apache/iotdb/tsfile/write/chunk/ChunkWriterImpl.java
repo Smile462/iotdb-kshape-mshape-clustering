@@ -429,7 +429,12 @@ public class ChunkWriterImpl implements IChunkWriter {
       return;
     }
 
-    if (!pageStatisticsList.isEmpty()) {
+    statistics.journalPageAlias = numOfPages == 1;
+    statistics.isChunkStatistics = true;
+    if (!"SP".equals(System.getProperty("journal.storage_state", "SH"))
+        && !"S0".equals(System.getProperty("journal.storage_state", "SH"))
+        && numOfPages > 1
+        && !pageStatisticsList.isEmpty()) {
       statistics.updateChunkStatistics(pageStatisticsList);
       statistics.updateChunkMStatistics(pageStatisticsList);
     }

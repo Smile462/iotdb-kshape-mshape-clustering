@@ -150,15 +150,11 @@ public class KMeans {
         if (!emptyCentroids.contains(i)) nonemptyCentroids.add(centroids[i]);
 
       Random r = new Random();
-      for (int i : emptyCentroids)
-        while (true) {
-          int rand = r.nextInt(points.length);
-          if (!nonemptyCentroids.contains(points[rand])) {
-            nonemptyCentroids.add(points[rand]);
-            centroids[i] = points[rand];
-            break;
-          }
-        }
+      for (int i : emptyCentroids) {
+        // k may exceed a tail page's sample count; allow replacement and do
+        // not alias a mutable centroid to the original observation array.
+        centroids[i] = points[r.nextInt(points.length)].clone();
+      }
     }
   }
 
