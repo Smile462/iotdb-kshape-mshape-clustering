@@ -24,6 +24,7 @@ public final class JournalSelection {
       payload,
       represented,
       outside;
+  long correctedPages;
   long started = System.nanoTime(), selectionNanos, candidateNanos;
   long candidateHash = 0xcbf29ce484222325L;
   int candidateCount = 0;
@@ -118,6 +119,58 @@ public final class JournalSelection {
     account(current);
   }
 
+  interface PageCorrector {
+    Statistics correct(BatchData batch, Statistics statistics);
+  }
+
+  void addCorrectedPage(
+      List<Statistics> units, BatchData batch, Statistics stored, PageCorrector corrector)
+      throws IOException {
+    if (batch.length() == 0) throw new IOException("Usable Page metadata has no raw observations");
+    Statistics working = stored.clone();
+    working.idx = stored.idx.clone();
+    working.edIdx = stored.edIdx.clone();
+    Statistics corrected = corrector.correct(batch, working);
+    raw += batch.length();
+    boundaryRaw += batch.length();
+    // The Page method rounds its metadata bounds. Restore the actual retained
+    // raw span and adapt only fragments for the Chunk aggregator's grid layout.
+    corrected.headExtraPoints = new double[l];
+    corrected.tailExtraPoints = new double[l];
+    batch.resetBatchData();
+    IBatchDataIterator iterator = batch.getBatchDataIterator();
+    long first = Long.MAX_VALUE, last = Long.MIN_VALUE;
+    while (iterator.hasNext()) {
+      long time = iterator.currentTime();
+      if (time >= a && time <= b) {
+        first = Math.min(first, time);
+        last = Math.max(last, time);
+      }
+      iterator.next();
+    }
+    if (first == Long.MAX_VALUE) return;
+    long firstComplete = -Math.floorDiv(-first, l) * l;
+    long tailStart = Math.floorDiv(last + 1, l) * l;
+    batch.resetBatchData();
+    iterator = batch.getBatchDataIterator();
+    while (iterator.hasNext()) {
+      long time = iterator.currentTime();
+      if (time >= first && time <= last) {
+        int position = (int) Math.floorMod(time, (long) l);
+        double value = ((Number) iterator.currentValue()).doubleValue();
+        if (time < firstComplete) corrected.headExtraPoints[position] = value;
+        if (time >= tailStart) corrected.tailExtraPoints[position] = value;
+      }
+      iterator.next();
+    }
+    corrected.setStartTime(first);
+    corrected.setEndTime(last);
+    corrected.journalGridFragments = true;
+    units.add(corrected);
+    correctedPages++;
+    account(corrected);
+  }
+
   static double[] boundarySequence(List<Statistics> units, int i, int l) {
     Statistics current = units.get(i);
     long start = current.getStartTime(), row = start / l * l, end = row + l - 1;
@@ -146,6 +199,17 @@ public final class JournalSelection {
       TSDataType type,
       QueryContext ctx,
       QueryDataSource data)
+      throws IOException {
+    return select(path, sensors, type, ctx, data, null);
+  }
+
+  List<Statistics> select(
+      PartialPath path,
+      Set<String> sensors,
+      TSDataType type,
+      QueryContext ctx,
+      QueryDataSource data,
+      PageCorrector corrector)
       throws IOException {
     double tp = Double.parseDouble(params.getOrDefault("theta_page", "0.8"));
     double tc = Double.parseDouble(params.getOrDefault("theta_chunk", "0.8"));
@@ -176,15 +240,15 @@ public final class JournalSelection {
         }
         List<Statistics> dynamic = new ArrayList<>();
         while (reader.hasNextPage()) {
-          Statistics ps = reader.currentPageStatistics();
-          if (ps != null) ps = Statistics.journalChunkView(ps);
+          Statistics storedPage = reader.currentPageStatistics();
+          Statistics ps = storedPage == null ? null : Statistics.journalChunkView(storedPage);
           double pr = ps == null ? 1. : ratio(ps);
+          boolean usablePage = storedPage != null && reader.canUseCurrentPageStatistics();
           if (pr <= 0) {
             reader.skipCurrentPage();
             continue;
           }
-          if (reader.canUseCurrentPageStatistics()
-              && ((use && ablation.equals("dynamic")) || pr >= tp)) {
+          if (usablePage && ((use && ablation.equals("dynamic")) || pr >= tp)) {
             if (use && ablation.equals("dynamic")) dynamic.add(ps);
             else {
               units.add(ps);
@@ -192,6 +256,8 @@ public final class JournalSelection {
               account(ps);
             }
             reader.skipCurrentPage();
+          } else if (corrector != null && usablePage && pr < tp) {
+            addCorrectedPage(units, reader.nextPage(), storedPage, corrector);
           } else {
             addTemporaryPage(units, reader.nextPage());
           }
@@ -241,6 +307,8 @@ public final class JournalSelection {
             + pages
             + ",\"selected_temp\":"
             + temp
+            + ",\"page_corrections\":"
+            + correctedPages
             + ",\"raw_points\":"
             + raw
             + ",\"boundary_raw_points\":"

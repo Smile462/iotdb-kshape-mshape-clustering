@@ -212,6 +212,7 @@ public class KshapeMExecutor {
     for (int i = 1; i < statisticsList.size(); i++) {
       Statistics curStatistic = statisticsList.get(i);
       for (int j = 0; j < curStatistic.edCentroids.length; j++) {
+        if (curStatistic.edCounts[j] == 0) continue;
         // find the nearest centroid
         int nearestIdx = findNearestCentroid(curStatistic.edCentroids[j], edCentroids);
         if (nearestIdx != -1) {
@@ -402,8 +403,18 @@ public class KshapeMExecutor {
 
     JournalSelection journal = new JournalSelection(parameters, startTimeBound, endTimeBound, l, k);
     journal.started = journalRequestStart;
+    final int correctionStart = startTimeBound;
+    final int correctionEnd = endTimeBound;
     List<Statistics> statisticsList =
-        journal.select(seriesPath, measurements, tsDataType, context, queryDataSource);
+        journal.select(
+            seriesPath,
+            measurements,
+            tsDataType,
+            context,
+            queryDataSource,
+            (batch, statistics) ->
+                updateByIter(
+                    batch.getBatchDataIterator(), statistics, correctionStart, correctionEnd, -1));
     if (statisticsList.isEmpty()) throw new IOException("Q has no selected metadata");
     // 全局合并（与 executePageKshapeM 完全一致）
     startTime = System.currentTimeMillis();
@@ -580,6 +591,7 @@ public class KshapeMExecutor {
       List<double[]> curCoreset, List<double[]> edCentroids, List<Integer> counts) {
     double res = 0.0;
     for (int i = 0; i < edCentroids.size(); i++) {
+      if (counts.get(i) == 0) continue;
       int idx = -1;
       double maxNcc = Double.MIN_VALUE;
       for (int j = 0; j < curCoreset.size(); j++) {
@@ -600,6 +612,7 @@ public class KshapeMExecutor {
   private double approxEvaluate(List<double[]> curCoreset, double[][] edCentroids, int[] counts) {
     double res = 0.0;
     for (int i = 0; i < edCentroids.length; i++) {
+      if (counts[i] == 0) continue;
       int idx = -1;
       double maxNcc = Double.MIN_VALUE;
       for (int j = 0; j < curCoreset.size(); j++) {
@@ -736,7 +749,11 @@ public class KshapeMExecutor {
       }
     }
 
-    // update new tail points
+    Statistics newStatistic = curStatistic.clone();
+    newStatistic.idx = curStatistic.idx.clone();
+    newStatistic.edIdx = curStatistic.edIdx.clone();
+
+    // update new tail points on the query-local copy
     List<Double> newTailPoints = new ArrayList<>();
     for (int i = 0; i < curTimeWindow.size(); i++) {
       if (curTimeWindow.get(i) >= findPre(newEndTime) && curTimeWindow.get(i) <= newEndTime)
@@ -746,25 +763,29 @@ public class KshapeMExecutor {
       double[] newTailPointsArray = new double[l];
       for (int i = 0; i < newTailPoints.size(); i++)
         newTailPointsArray[l - newTailPoints.size() + i] = newTailPoints.get(i);
-      curStatistic.tailExtraPoints = newTailPointsArray;
+      newStatistic.tailExtraPoints = newTailPointsArray;
     }
 
-    // for each rmSeq, update its corresponding sumMatrix and the corresponding centroid and
-    // delta
-
-    Statistics newStatistic = curStatistic.clone();
-
+    // Stored edIdx labels belong to the M approximation. K-Shape cluster
+    // indices are unrelated and must not be used to subtract M weights.
+    long firstStoredSequence = findSuc(curStatistic.getStartTime());
     for (int i = 0; i < rmSeqsValue.size(); i++) {
-      List<Double> _seq = rmSeqsValue.get(i);
-      int nearestIdx =
-          findNearestCentroid(_seq.stream().mapToDouble(d -> d).toArray(), newStatistic.centroids);
-      if (nearestIdx != -1) {
-        MathUtils.updateEdCentroid(
-            newStatistic.edCentroids[nearestIdx], newStatistic.edCounts[nearestIdx], _seq);
-        newStatistic.edCounts[nearestIdx] -= 1;
-        newStatistic.setIdx(
-            -1, (int) ((rmSeqsTime.get(i).get(0) * 1.0 - curTimeWindow.get(0)) / l));
+      long sequenceStart = rmSeqsTime.get(i).get(0);
+      int sequenceIndex = Math.toIntExact((sequenceStart - firstStoredSequence) / l);
+      if (sequenceIndex < 0 || sequenceIndex >= curStatistic.edIdx.length) {
+        throw new IllegalStateException("Page-M subsequence has no stored cluster label");
       }
+      int cluster = curStatistic.edIdx[sequenceIndex];
+      if (cluster < 0 || cluster >= newStatistic.edCounts.length) {
+        throw new IllegalStateException("Invalid stored Page-M cluster label");
+      }
+      double[] values = rmSeqsValue.get(i).stream().mapToDouble(Double::doubleValue).toArray();
+      List<Double> normalized = new ArrayList<>(l);
+      for (double value : MathUtils._zscore(values)) normalized.add(value);
+      MathUtils.updateEdCentroid(
+          newStatistic.edCentroids[cluster], newStatistic.edCounts[cluster], normalized);
+      newStatistic.edCounts[cluster]--;
+      newStatistic.edIdx[sequenceIndex] = -1;
     }
     newStatistic.setCount((int) (newStatistic.getCount() - rmSeqsValue.size() * l));
     newStatistic.setStartTime(findSuc(newStartTime));

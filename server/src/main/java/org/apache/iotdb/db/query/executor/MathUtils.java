@@ -165,6 +165,13 @@ public class MathUtils {
   }
 
   public static void updateEdCentroid(double[] edCentroid, int edCount, List<Double> vector) {
+    if (edCount <= 0) {
+      throw new IllegalStateException("Cannot remove a subsequence from an empty Page-M cluster");
+    }
+    if (edCount == 1) {
+      java.util.Arrays.fill(edCentroid, 0.0);
+      return;
+    }
     for (int i = 0; i < edCentroid.length; i++) {
       edCentroid[i] = (edCentroid[i] * edCount - vector.get(i)) / (edCount - 1);
     }
