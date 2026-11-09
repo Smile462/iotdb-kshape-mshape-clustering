@@ -72,6 +72,9 @@ public abstract class Statistics<T extends Serializable> {
   private long endTime = Long.MIN_VALUE;
   private List<Long> timeWindow = new ArrayList<>();
   private List<Double> valueWindow = new ArrayList<>();
+  // A sealed Page is serialized and used for Chunk aggregation more than once.
+  // Reuse its fitted payload until the underlying points or bounds change.
+  private boolean journalPageStatisticsReady = false;
   private static final int k = tsFileConfig.getClusterNum(); // cluster num
   private static final int l = tsFileConfig.getSeqLength(); // subsequence length
   private static final int edK = k + 2; // cluster num for euclidean
@@ -145,6 +148,7 @@ public abstract class Statistics<T extends Serializable> {
     newInstance.isChunkStatistics = this.isChunkStatistics;
     newInstance.journalPageAlias = this.journalPageAlias;
     newInstance.journalStoredPayload = this.journalStoredPayload;
+    newInstance.journalPageStatisticsReady = this.journalPageStatisticsReady;
     return newInstance;
   }
 
@@ -280,6 +284,7 @@ public abstract class Statistics<T extends Serializable> {
         this.journalStoredPayload = stats.journalStoredPayload;
         this.timeWindow = stats.timeWindow;
         this.valueWindow = stats.valueWindow;
+        this.journalPageStatisticsReady = stats.journalPageStatisticsReady;
 
         this.sumMatrices = stats.sumMatrices;
         this.centroids = stats.centroids;
@@ -348,6 +353,7 @@ public abstract class Statistics<T extends Serializable> {
   }
 
   public void update(long time) {
+    journalPageStatisticsReady = false;
     if (time < startTime) {
       startTime = time;
     }
@@ -388,6 +394,7 @@ public abstract class Statistics<T extends Serializable> {
   }
 
   public void update(long[] time, int batchSize) {
+    journalPageStatisticsReady = false;
     if (time[0] < startTime) {
       startTime = time[0];
     }
@@ -505,6 +512,7 @@ public abstract class Statistics<T extends Serializable> {
       statistics.setTailExtraPoints(ReadWriteIOUtils.readDouble(inputStream), i);
     statistics.deserialize(inputStream);
     statistics.isEmpty = false;
+    statistics.journalPageStatisticsReady = true;
     return statistics;
   }
 
@@ -547,6 +555,7 @@ public abstract class Statistics<T extends Serializable> {
 
     statistics.deserialize(buffer);
     statistics.isEmpty = false;
+    statistics.journalPageStatisticsReady = true;
     return statistics;
   }
 
@@ -563,14 +572,17 @@ public abstract class Statistics<T extends Serializable> {
   }
 
   public void setStartTime(long startTime) {
+    if (this.startTime != startTime) journalPageStatisticsReady = false;
     this.startTime = startTime;
   }
 
   public void setEndTime(long endTime) {
+    if (this.endTime != endTime) journalPageStatisticsReady = false;
     this.endTime = endTime;
   }
 
   public void setCount(int count) {
+    if (this.count != count) journalPageStatisticsReady = false;
     this.count = count;
   }
 
@@ -635,7 +647,8 @@ public abstract class Statistics<T extends Serializable> {
   }
 
   public void updateStatistics() {
-    if ("S0".equals(System.getProperty("journal.storage_state", "SH"))) return;
+    if ("S0".equals(System.getProperty("journal.storage_state", "SH"))
+        || journalPageStatisticsReady) return;
     long journalBegin = System.nanoTime();
     try {
 
@@ -644,6 +657,8 @@ public abstract class Statistics<T extends Serializable> {
       long seqStartTime = (long) (Math.ceil(this.startTime * 1.0 / l) * l);
       long seqEndTime = (long) (Math.floor(this.endTime * 1.0 / l) * l);
       Arrays.fill(this.idx, -1);
+      Arrays.fill(this.headExtraPoints, 0);
+      Arrays.fill(this.tailExtraPoints, 0);
 
       List<List<Double>> tmpSeqs = new ArrayList<>();
       List<Double> tmpSeq = new ArrayList<>();
@@ -671,7 +686,10 @@ public abstract class Statistics<T extends Serializable> {
         X[i] = normalize(X[i]);
       }
 
-      if (X.length == 0) return;
+      if (X.length == 0) {
+        journalPageStatisticsReady = true;
+        return;
+      }
       int seqNum = X.length;
       int l = X[0].length;
 
@@ -695,6 +713,8 @@ public abstract class Statistics<T extends Serializable> {
         if (idx == -1) break;
         this.edCounts[idx]++;
       }
+      // Publish only after both K and M payloads were built successfully.
+      journalPageStatisticsReady = true;
     } finally {
       System.out.println("JOURNAL_BUILD_PAGE_NS=" + (System.nanoTime() - journalBegin));
     }
