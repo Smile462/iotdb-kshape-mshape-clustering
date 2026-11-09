@@ -338,8 +338,18 @@ public class KshapeExecutor {
 
     JournalSelection journal = new JournalSelection(parameters, startTimeBound, endTimeBound, l, k);
     journal.started = journalRequestStart;
+    final int correctionStart = startTimeBound;
+    final int correctionEnd = endTimeBound;
     List<Statistics> statisticsList =
-        journal.select(seriesPath, measurements, tsDataType, context, queryDataSource);
+        journal.select(
+            seriesPath,
+            measurements,
+            tsDataType,
+            context,
+            queryDataSource,
+            (batch, statistics) ->
+                updateByIter(
+                    batch.getBatchDataIterator(), statistics, correctionStart, correctionEnd, -1));
     if (statisticsList.isEmpty()) throw new IOException("Q has no selected metadata");
     // ========== 全局合并（与原来完全一致） ==========
     startTime = System.currentTimeMillis();
