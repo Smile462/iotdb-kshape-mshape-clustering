@@ -11,6 +11,7 @@ public final class PageSafety {
   final Map<String, String> parameters;
   final long started = System.nanoTime();
   int recovered = 0;
+  long overlapCorrections = 0;
 
   PageSafety(Map<String, String> parameters) {
     this.parameters = parameters;
@@ -46,7 +47,7 @@ public final class PageSafety {
             + ",\"selected_temp\":"
             + recovered
             + ",\"page_corrections\":"
-            + correctionCount
+            + (correctionCount + overlapCorrections)
             + ",\"query_build_chunk_calls\":0,\"raw_points\":-1,\"represented_subsequences\":-1,\"counter_scope\":\"legacy Page counters unavailable; no inferred coverage claims\",\"engine_query_seconds\":"
             + ((System.nanoTime() - started) / 1e9)
             + "}");

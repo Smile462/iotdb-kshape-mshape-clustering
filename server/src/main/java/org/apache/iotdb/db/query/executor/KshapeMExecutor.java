@@ -149,56 +149,78 @@ public class KshapeMExecutor {
 
     long splitTimeCost = 0, mergeTimeCost = 0, startTime;
 
-    // mark unseq pages
-    while (seriesReader.hasNextFile()) {
-      while (seriesReader.hasNextChunk()) {
-        while (seriesReader.hasNextPage()) {
-          if (seriesReader.currentPageStatistics() == null
-              || !seriesReader.canUseCurrentPageStatistics()) {
-            Statistics recovered =
-                pageSafety.readPage(
-                    seriesReader.nextPage().getBatchDataIterator(),
-                    startTimeBound,
-                    endTimeBound,
-                    l);
-            if (recovered != null) {
-              statisticsList.add(recovered);
-              ifUnseq.add(false);
+    OverlapStatistics.Selection overlap =
+        OverlapStatistics.select(
+            seriesPath,
+            measurements,
+            tsDataType,
+            context,
+            queryDataSource,
+            parameters,
+            startTimeBound,
+            endTimeBound,
+            l,
+            (batch, statistics, start, end, next) ->
+                updateByIter(batch.getBatchDataIterator(), statistics, start, end, next));
+    if (overlap != null) {
+      statisticsList.addAll(overlap.units);
+      for (int i = 0; i < overlap.units.size(); i++) ifUnseq.add(false);
+      pageSafety.overlapCorrections = overlap.corrections;
+      curIndex = overlap.units.size();
+    }
+    // The no-overlap branch is the existing Page implementation.
+    if (overlap == null)
+      while (seriesReader.hasNextFile()) {
+        while (seriesReader.hasNextChunk()) {
+          while (seriesReader.hasNextPage()) {
+            if (seriesReader.currentPageStatistics() == null
+                || !seriesReader.canUseCurrentPageStatistics()) {
+              Statistics recovered =
+                  pageSafety.readPage(
+                      seriesReader.nextPage().getBatchDataIterator(),
+                      startTimeBound,
+                      endTimeBound,
+                      l);
+              if (recovered != null) {
+                statisticsList.add(recovered);
+                ifUnseq.add(false);
+              }
+              curIndex++;
+              continue;
             }
-            curIndex++;
-            continue;
-          }
-          if (findPre(seriesReader.currentPageStatistics().getEndTime()) <= startTimeBound
-              || findSuc(seriesReader.currentPageStatistics().getStartTime()) > endTimeBound) {
-            curIndex++;
-            seriesReader.skipCurrentPage();
-            continue;
-          }
-          cnt += 1;
-          if (seriesReader.canUseCurrentPageStatistics()) {
-            Statistics pageStatistic = seriesReader.currentPageStatistics();
+            if (findPre(seriesReader.currentPageStatistics().getEndTime()) <= startTimeBound
+                || findSuc(seriesReader.currentPageStatistics().getStartTime()) > endTimeBound) {
+              curIndex++;
+              seriesReader.skipCurrentPage();
+              continue;
+            }
+            cnt += 1;
+            if (seriesReader.canUseCurrentPageStatistics()) {
+              Statistics pageStatistic = seriesReader.currentPageStatistics();
 
-            boolean UnseqPageFlag;
-            if (pageStatistic.getStartTime() < startTimeBound
-                && pageStatistic.getEndTime() >= startTimeBound) UnseqPageFlag = true;
-            else if (pageStatistic.getStartTime() <= endTimeBound
-                && pageStatistic.getEndTime() > endTimeBound) UnseqPageFlag = true;
-            else UnseqPageFlag = false;
-            ifUnseq.add(UnseqPageFlag);
-            if (UnseqPageFlag) {
-              IBatchDataIterator batchDataIterator = seriesReader.nextPage().getBatchDataIterator();
-              startTime = System.currentTimeMillis();
-              pageStatistic =
-                  updateByIter(batchDataIterator, pageStatistic, startTimeBound, endTimeBound, -1);
-              splitTimeCost += System.currentTimeMillis() - startTime;
+              boolean UnseqPageFlag;
+              if (pageStatistic.getStartTime() < startTimeBound
+                  && pageStatistic.getEndTime() >= startTimeBound) UnseqPageFlag = true;
+              else if (pageStatistic.getStartTime() <= endTimeBound
+                  && pageStatistic.getEndTime() > endTimeBound) UnseqPageFlag = true;
+              else UnseqPageFlag = false;
+              ifUnseq.add(UnseqPageFlag);
+              if (UnseqPageFlag) {
+                IBatchDataIterator batchDataIterator =
+                    seriesReader.nextPage().getBatchDataIterator();
+                startTime = System.currentTimeMillis();
+                pageStatistic =
+                    updateByIter(
+                        batchDataIterator, pageStatistic, startTimeBound, endTimeBound, -1);
+                splitTimeCost += System.currentTimeMillis() - startTime;
+              }
+              statisticsList.add(pageStatistic);
+              seriesReader.skipCurrentPage();
             }
-            statisticsList.add(pageStatistic);
-            seriesReader.skipCurrentPage();
+            curIndex++;
           }
-          curIndex++;
         }
       }
-    }
     System.out.println("Page num:" + curIndex);
     System.out.println("Filtered Page num:" + statisticsList.size());
 
@@ -226,6 +248,8 @@ public class KshapeMExecutor {
         }
       }
 
+      double[] overlapSequence =
+          overlap == null ? null : JournalSelection.boundarySequence(statisticsList, i, l);
       double[] curHeadExtraPoints = curStatistic.headExtraPoints;
       boolean complementaryFlag = false;
       for (double v : curHeadExtraPoints)
@@ -234,11 +258,13 @@ public class KshapeMExecutor {
           break;
         }
 
+      if (overlap != null) complementaryFlag = overlapSequence != null;
       if (complementaryFlag) {
-        double[] merged = new double[l];
-        for (int j = 0; j < l; j++) {
-          merged[j] = curHeadExtraPoints[j] + statisticsList.get(i - 1).tailExtraPoints[j];
-        }
+        double[] merged = overlap == null ? new double[l] : overlapSequence;
+        if (overlap == null)
+          for (int j = 0; j < l; j++) {
+            merged[j] = curHeadExtraPoints[j] + statisticsList.get(i - 1).tailExtraPoints[j];
+          }
         merged = MathUtils._zscore(merged);
         int nearestIdx = findNearestCentroid(merged, edCentroids);
         if (nearestIdx != -1) {
@@ -414,7 +440,9 @@ public class KshapeMExecutor {
             queryDataSource,
             (batch, statistics) ->
                 updateByIter(
-                    batch.getBatchDataIterator(), statistics, correctionStart, correctionEnd, -1));
+                    batch.getBatchDataIterator(), statistics, correctionStart, correctionEnd, -1),
+            (batch, statistics, start, end, next) ->
+                updateByIter(batch.getBatchDataIterator(), statistics, start, end, next));
     if (statisticsList.isEmpty()) throw new IOException("Q has no selected metadata");
     // 全局合并（与 executePageKshapeM 完全一致）
     startTime = System.currentTimeMillis();

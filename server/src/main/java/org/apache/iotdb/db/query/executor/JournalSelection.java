@@ -211,6 +211,32 @@ public final class JournalSelection {
       QueryDataSource data,
       PageCorrector corrector)
       throws IOException {
+    return select(path, sensors, type, ctx, data, corrector, null);
+  }
+
+  List<Statistics> select(
+      PartialPath path,
+      Set<String> sensors,
+      TSDataType type,
+      QueryContext ctx,
+      QueryDataSource data,
+      PageCorrector corrector,
+      OverlapStatistics.Corrector overlapCorrector)
+      throws IOException {
+    OverlapStatistics.Selection overlap =
+        OverlapStatistics.select(path, sensors, type, ctx, data, params, a, b, l, overlapCorrector);
+    if (overlap != null) {
+      chunks = overlap.chunks;
+      pages = overlap.pages;
+      correctedPages = overlap.corrections;
+      raw = overlap.rawPoints;
+      boundaryRaw = overlap.rawPoints;
+      for (Statistics unit : overlap.units) account(unit);
+      for (int i = 1; i < overlap.units.size(); i++)
+        if (boundarySequence(overlap.units, i, l) != null) represented++;
+      selectionNanos = System.nanoTime() - started;
+      return overlap.units;
+    }
     double tp = Double.parseDouble(params.getOrDefault("theta_page", "0.8"));
     double tc = Double.parseDouble(params.getOrDefault("theta_chunk", "0.8"));
     boolean page = params.getOrDefault("level", "page").equals("page");
