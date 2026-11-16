@@ -26,23 +26,16 @@ import org.apache.iotdb.db.query.reader.series.SeriesReader;
 import org.apache.iotdb.tsfile.file.metadata.ChunkMetadata;
 import org.apache.iotdb.tsfile.file.metadata.enums.TSDataType;
 import org.apache.iotdb.tsfile.file.metadata.statistics.Statistics;
+import org.apache.iotdb.tsfile.file.metadata.statistics.util.CompleteSubsequences;
 import org.apache.iotdb.tsfile.read.common.BatchData;
 import org.apache.iotdb.tsfile.read.common.Chunk;
-import org.apache.iotdb.tsfile.read.common.IBatchDataIterator;
 import org.apache.iotdb.tsfile.read.reader.IPageReader;
 import org.apache.iotdb.tsfile.read.reader.chunk.ChunkReader;
 
 import java.io.IOException;
 import java.util.*;
 
-/**
- * Original-statistics subtraction for identical, ordered overlapping Pages.
- *
- * <p>The legacy overlap rule retains a Page only up to the next Page's start minus one. Unlike
- * SeriesReader's merged batches, these records keep the original fitted payload and labels.
- * Nonidentical versions, deletions and noncontiguous inputs use the normal reader. No query-time
- * local clustering is performed here.
- */
+/** Reuse complete-window metadata across range overlaps with unique timestamps. */
 final class OverlapStatistics {
   interface Corrector {
     Statistics correct(BatchData raw, Statistics stored, long start, long end, long nextStart);
@@ -53,14 +46,11 @@ final class OverlapStatistics {
     final IPageReader reader;
     final ChunkMetadata chunk;
     BatchData raw;
-    double[] values;
-    long retainedEnd;
 
     Page(Statistics statistics, IPageReader reader, ChunkMetadata chunk) {
       this.statistics = statistics;
       this.reader = reader;
       this.chunk = chunk;
-      this.retainedEnd = statistics.getEndTime();
     }
 
     long start() {
@@ -70,11 +60,24 @@ final class OverlapStatistics {
     long end() {
       return statistics.getEndTime();
     }
+
+    boolean sparse() {
+      return statistics.getCount() < end() - start() + 1;
+    }
+
+    BatchData decode(Selection result) throws IOException {
+      if (raw == null) {
+        raw = reader.getAllSatisfiedPageData(true);
+        result.rawPoints += raw.length();
+      }
+      return raw;
+    }
   }
 
   static final class Selection {
     final List<Statistics> units = new ArrayList<>();
-    long chunks, pages, corrections, rawPoints, overlapPages;
+    final List<double[]> sequences = new ArrayList<>();
+    long chunks, pages, corrections, rawPoints, overlapPages, reusedWindows, incompleteWindows;
   }
 
   static Selection select(
@@ -89,33 +92,35 @@ final class OverlapStatistics {
       int l,
       Corrector corrector)
       throws IOException {
-    // This O(1) gate leaves the section 8.2 sequential-data path unchanged.
+    // Preserve the existing sequential-data path, including ordinary Page correction.
     if (source.getUnseqResources().isEmpty() || corrector == null) return null;
     if (!parameters.getOrDefault("ablation", "normal").equals("normal")) return null;
     List<ChunkMetadata> chunks =
         new SeriesReader(path, sensors, type, context, source, null, null, null, true)
             .getAllChunkMetadatas();
-    boolean overlap = false;
     List<ChunkMetadata> ordered = new ArrayList<>(chunks);
     ordered.sort(Comparator.comparingLong(ChunkMetadata::getStartTime));
     long right = Long.MIN_VALUE;
+    boolean overlapping = false;
     for (ChunkMetadata chunk : ordered) {
-      overlap |= chunk.getStartTime() <= right;
+      overlapping |= chunk.getStartTime() <= right;
       right = Math.max(right, chunk.getEndTime());
     }
-    if (!overlap) return null;
+    if (!overlapping) return null;
     List<Page> pages = new ArrayList<>();
     for (ChunkMetadata metadata : chunks) {
       if (metadata.getChunkLoader() instanceof MemChunkLoader
           || (metadata.getDeleteIntervalList() != null
-              && !metadata.getDeleteIntervalList().isEmpty())) return null;
+              && !metadata.getDeleteIntervalList().isEmpty()))
+        throw new IOException("Unique-overlap metadata requires sealed, undeleted Pages");
       Chunk chunk = metadata.getChunkLoader().loadChunk(metadata);
       chunk.setFromOldFile(metadata.isFromOldTsFile());
       ChunkReader reader = new ChunkReader(chunk, null);
       for (IPageReader page : reader.loadPageReaderList()) {
         if (page.isModified()
             || page.getStatistics() == null
-            || !page.getStatistics().journalPayload()) return null;
+            || !page.getStatistics().journalPayload())
+          throw new IOException("Missing overlap Page payload; rebuild imported metadata");
         pages.add(new Page(page.getStatistics(), page, metadata));
       }
     }
@@ -123,143 +128,239 @@ final class OverlapStatistics {
   }
 
   static Selection selectPages(
-      List<Page> pages, Map<String, String> parameters, int a, int b, int l, Corrector corrector)
+      List<Page> pages,
+      Map<String, String> parameters,
+      int a,
+      int b,
+      int l,
+      Corrector unusedLegacyCorrector)
       throws IOException {
     pages.sort(Comparator.comparingLong(Page::start));
+    long right = Long.MIN_VALUE;
     boolean overlapping = false;
-    for (int i = 1; i < pages.size(); i++) {
-      Page previous = pages.get(i - 1), current = pages.get(i);
-      // The old next-start clipping rule requires strictly increasing endpoints.
-      if (current.start() <= previous.start() || current.end() <= previous.end()) return null;
-      if (current.start() <= previous.end()) {
-        previous.retainedEnd = current.start() - 1;
-        overlapping = true;
-      }
+    for (Page page : pages) {
+      overlapping |= page.start() <= right;
+      right = Math.max(right, page.end());
+      if (page.sparse()
+          && (page.statistics.idx[page.statistics.idx.length - 1] != -2
+              || page.statistics.edIdx[page.statistics.edIdx.length - 1] != -2))
+        throw new IOException(
+            "Sparse Page has obsolete packed labels; rebuild metadata with current code");
     }
     if (!overlapping) return null;
-    // Verify the experimental duplicate semantics before reusing any payload.
-    // Adjacent equal overlaps imply equality for every multiply covered timestamp.
-    Page previous = null;
-    for (Page current : pages) {
-      long size = current.end() - current.start() + 1;
-      if (size != current.statistics.getCount() || size > Integer.MAX_VALUE) return null;
-      current.raw = current.reader.getAllSatisfiedPageData(true);
-      if (current.raw.length() != size) return null;
-      current.values = new double[(int) size];
-      IBatchDataIterator it = current.raw.getBatchDataIterator();
-      int index = 0;
-      while (it.hasNext()) {
-        if (it.currentTime() != current.start() + index) return null;
-        double value = ((Number) it.currentValue()).doubleValue();
-        if (!Double.isFinite(value)) return null;
-        current.values[index++] = value;
-        it.next();
-      }
-      if (previous != null) {
-        for (long t = current.start(); t <= previous.end(); t++)
-          if (Double.doubleToLongBits(current.values[(int) (t - current.start())])
-              != Double.doubleToLongBits(previous.values[(int) (t - previous.start())]))
-            return null;
-        previous.values = null;
-      }
-      previous = current;
-    }
-    if (previous != null) previous.values = null;
-
+    Selection result = new Selection();
+    long first = ceil(Math.max((long) a, pages.get(0).start()), l);
+    long last = Math.floorDiv(Math.min((long) b, right) + 1, l) * l - l;
+    if (first > last) throw new IOException("Query contains no complete original-grid subsequence");
+    Map<ChunkMetadata, List<Page>> groups = new IdentityHashMap<>();
+    for (Page page : pages)
+      if (page.chunk != null)
+        groups.computeIfAbsent(page.chunk, key -> new ArrayList<>()).add(page);
     boolean pageLevel = parameters.getOrDefault("level", "page").equals("page");
     double tp = Double.parseDouble(parameters.getOrDefault("theta_page", "0.8"));
     double tc = Double.parseDouble(parameters.getOrDefault("theta_chunk", "0.8"));
-    Set<ChunkMetadata> distinct = Collections.newSetFromMap(new IdentityHashMap<>());
-    for (Page p : pages) if (p.chunk != null) distinct.add(p.chunk);
-    Set<ChunkMetadata> coarse = Collections.newSetFromMap(new IdentityHashMap<>());
-    if (!pageLevel) {
-      for (ChunkMetadata c : distinct) {
-        boolean clear = true;
-        for (ChunkMetadata other : distinct)
-          if (c != other
-              && c.getStartTime() <= other.getEndTime()
-              && other.getStartTime() <= c.getEndTime()) {
-            clear = false;
-            break;
-          }
-        if (clear && ratio(c.getStartTime(), c.getEndTime(), a, b) >= tc) coarse.add(c);
-      }
-    }
     Set<ChunkMetadata> used = Collections.newSetFromMap(new IdentityHashMap<>());
-    Selection result = new Selection();
+    Set<Long> covered = new HashSet<>();
     for (Page page : pages) {
       if (page.end() < a || page.start() > b) continue;
-      if (page.retainedEnd != page.end()) result.overlapPages++;
-      if (coarse.contains(page.chunk)) {
-        if (used.add(page.chunk)) {
-          result.units.add(Statistics.journalChunkView(page.chunk.getStatistics()));
+      if (page.sparse()) result.overlapPages++;
+      ChunkMetadata chunk = page.chunk;
+      if (!pageLevel
+          && chunk != null
+          && chunk.getStatistics().journalPayload()
+          && chunk.getStatistics().idx[0] == Integer.MIN_VALUE
+          && ratio(chunk.getStartTime(), chunk.getEndTime(), a, b) >= tc) {
+        if (used.add(chunk)) {
+          result.units.add(Statistics.journalChunkView(chunk.getStatistics()));
           result.chunks++;
+          List<Page> members = groups.get(chunk);
+          boolean sparse = false;
+          for (Page member : members) {
+            mark(member.statistics, member.start(), l, first, last, covered);
+            sparse |= member.sparse();
+          }
+          // Dense Chunk payloads also include their original complete Page-boundary windows.
+          if (!sparse)
+            for (int i = 1; i < members.size(); i++) {
+              Page previous = members.get(i - 1), current = members.get(i);
+              long row = Math.floorDiv(current.start(), l) * l;
+              if (current.start() != row
+                  && previous.end() + 1 == current.start()
+                  && previous.start() <= row
+                  && current.end() >= row + l - 1
+                  && row >= first
+                  && row <= last
+                  && !covered.add(row))
+                throw new IOException("Duplicate complete subsequence in Chunk payloads");
+            }
         }
-      } else if (page.retainedEnd == page.end() && ratio(page.start(), page.end(), a, b) >= tp) {
-        result.units.add(Statistics.journalChunkView(page.statistics));
-        result.pages++;
-      } else {
-        long start = Math.max(a, page.start()), end = Math.min(b, page.retainedEnd);
-        if (start > end) continue;
-        Statistics corrected = subtract(page, start, end, l, corrector);
-        result.units.add(corrected);
-        result.corrections++;
-        result.rawPoints += page.raw.length();
+        continue;
       }
-      page.raw = null;
+      Statistics unit = page.statistics;
+      if (ratio(page.start(), page.end(), a, b) < tp) {
+        unit = crop(page, a, b, l, result);
+        result.corrections++;
+      } else result.pages++;
+      result.units.add(Statistics.journalChunkView(unit));
+      mark(unit, page.start(), l, first, last, covered);
     }
+    TreeMap<Long, PartialWindow> missing = new TreeMap<>();
+    for (long row = first; row <= last; row += l)
+      if (!covered.contains(row)) missing.put(row, new PartialWindow(l));
+    result.reusedWindows = covered.size();
+    for (Page page : pages) {
+      long low = Math.floorDiv(Math.max(page.start(), first), l) * l;
+      long high = Math.min(Math.floorDiv(page.end(), l) * l, last);
+      if (low > high || missing.subMap(low, true, high, true).isEmpty()) continue;
+      BatchData raw = page.decode(result);
+      for (int i = 0; i < raw.length(); i++) {
+        long t = raw.getTimeByIndex(i), row = Math.floorDiv(t, l) * l;
+        PartialWindow window = missing.get(row);
+        if (window == null) continue;
+        int position = (int) Math.floorMod(t, (long) l);
+        if (window.present.get(position))
+          throw new IOException("Duplicate timestamp in unique-overlap input: " + t);
+        double value = raw.getDoubleByIndex(i);
+        if (!Double.isFinite(value)) throw new IOException("Nonfinite overlap observation");
+        window.values[position] = value;
+        window.present.set(position);
+      }
+    }
+    for (PartialWindow window : missing.values()) {
+      if (window.present.cardinality() == l) result.sequences.add(window.values);
+      else result.incompleteWindows++;
+    }
+    if (result.units.isEmpty()) throw new IOException("No overlap metadata intersects query");
     result.units.sort(Comparator.comparingLong(Statistics::getStartTime));
+    System.out.println(
+        "JOURNAL_OVERLAP:{\"reused_windows\":"
+            + result.reusedWindows
+            + ",\"reconstructed_windows\":"
+            + result.sequences.size()
+            + ",\"incomplete_windows_skipped\":"
+            + result.incompleteWindows
+            + ",\"selected_chunks\":"
+            + result.chunks
+            + ",\"selected_pages\":"
+            + result.pages
+            + ",\"corrected_pages\":"
+            + result.corrections
+            + ",\"raw_points\":"
+            + result.rawPoints
+            + ",\"query_local_fit_calls\":0}");
     return result;
   }
 
-  static Statistics subtract(Page page, long start, long end, int l, Corrector corrector) {
-    long completeStart = -Math.floorDiv(-start, l) * l;
-    long completeEnd = Math.floorDiv(end + 1, l) * l - 1;
-    Statistics corrected;
-    if (completeStart <= completeEnd) {
-      page.raw.resetBatchData();
-      // Use the existing subtraction kernel, with complete-grid bounds. A subsequence
-      // cut by overlap ownership is reconstructed once from adjacent fragments below.
-      corrected =
-          corrector.correct(page.raw, page.statistics.clone(), completeStart, completeEnd, -1);
-    } else {
-      corrected = page.statistics.clone();
-      Arrays.fill(corrected.idx, -1);
-      Arrays.fill(corrected.edIdx, -1);
-      Arrays.fill(corrected.edCounts, 0);
-      for (double[] c : corrected.edCentroids) Arrays.fill(c, 0);
-      for (int c = 0; c < corrected.centroids.length; c++) clearK(corrected, c);
+  private static final class PartialWindow {
+    final double[] values;
+    final BitSet present;
+
+    PartialWindow(int length) {
+      values = new double[length];
+      present = new BitSet(length);
     }
-    for (int c = 0; c < corrected.centroids.length; c++)
-      if (MathUtils.clusterMemberNum(corrected.idx, c) == 0) clearK(corrected, c);
-    corrected.headExtraPoints = new double[l];
-    corrected.tailExtraPoints = new double[l];
-    page.raw.resetBatchData();
-    IBatchDataIterator it = page.raw.getBatchDataIterator();
-    while (it.hasNext()) {
-      long time = it.currentTime();
-      if (time >= start && time <= end) {
-        int position = (int) Math.floorMod(time, (long) l);
-        double value = ((Number) it.currentValue()).doubleValue();
-        if (time < completeStart) corrected.headExtraPoints[position] = value;
-        if (time > completeEnd) corrected.tailExtraPoints[position] = value;
+  }
+
+  private static void mark(
+      Statistics statistics, long originalStart, int l, long first, long last, Set<Long> covered)
+      throws IOException {
+    long base = ceil(originalStart, l);
+    for (int slot = 0; slot < statistics.idx.length; slot++) {
+      boolean shape = statistics.idx[slot] >= 0;
+      int label = statistics.edIdx[slot];
+      boolean medoid =
+          label >= 0 && label < statistics.edCounts.length && statistics.edCounts[label] > 0;
+      if (shape != medoid) throw new IOException("K/M Page label coverage differs");
+      if (!shape) continue;
+      long row = base + (long) slot * l;
+      if (row >= first && row <= last && !covered.add(row))
+        throw new IOException("Duplicate complete subsequence across unique Pages");
+    }
+  }
+
+  static Statistics crop(Page page, long a, long b, int l, Selection result) throws IOException {
+    Statistics copy = page.statistics.clone();
+    copy.idx = page.statistics.idx.clone();
+    copy.edIdx = page.statistics.edIdx.clone();
+    long base = ceil(page.start(), l);
+    Map<Long, double[]> windows = new HashMap<>();
+    BatchData raw = page.decode(result);
+    for (CompleteSubsequences.Window window : CompleteSubsequences.read(raw, l))
+      windows.put(window.start, window.values);
+    for (int slot = 0; slot < copy.idx.length; slot++) {
+      long row = base + (long) slot * l;
+      if (copy.idx[slot] < 0 || (row >= a && row + l - 1 <= b)) continue;
+      double[] original = windows.get(row);
+      if (original == null)
+        throw new IOException("Stored complete-window label has no corresponding observations");
+      double[] normalized = MathUtils._zscore(original);
+      int shape = copy.idx[slot], medoid = copy.edIdx[slot];
+      for (int u = 0; u < l; u++)
+        for (int v = 0; v < l; v++) copy.sumMatrices[shape][u][v] -= normalized[u] * normalized[v];
+      int count = copy.edCounts[medoid];
+      if (count <= 0) throw new IOException("Invalid stored M count");
+      for (int u = 0; u < l; u++)
+        copy.edCentroids[medoid][u] =
+            count == 1 ? 0 : (copy.edCentroids[medoid][u] * count - normalized[u]) / (count - 1);
+      copy.edCounts[medoid]--;
+      copy.idx[slot] = -1;
+      copy.edIdx[slot] = -1;
+    }
+    for (int c = 0; c < copy.centroids.length; c++)
+      if (MathUtils.clusterMemberNum(copy.idx, c) == 0) {
+        Arrays.fill(copy.centroids[c], 0);
+        for (double[] row : copy.sumMatrices[c]) Arrays.fill(row, 0);
+        copy.deltas[c] = 0;
       }
-      it.next();
+    Arrays.fill(copy.headExtraPoints, 0);
+    Arrays.fill(copy.tailExtraPoints, 0);
+    copy.journalGridFragments = true;
+    return copy;
+  }
+
+  static void mergeK(Selection selection, double[][] centers, double[][][] matrices, int[] counts) {
+    if (selection == null) return;
+    for (double[] raw : selection.sequences) {
+      double[] value = MathUtils._zscore(raw);
+      int cluster = nearest(value, centers, counts);
+      if (counts[cluster] == 0) centers[cluster] = value.clone();
+      for (int u = 0; u < value.length; u++)
+        for (int v = 0; v < value.length; v++) matrices[cluster][u][v] += value[u] * value[v];
+      counts[cluster]++;
     }
-    corrected.setStartTime(start);
-    corrected.setEndTime(end);
-    corrected.setCount((int) (end - start + 1));
-    corrected.journalGridFragments = true;
-    return corrected;
   }
 
-  private static void clearK(Statistics statistics, int cluster) {
-    Arrays.fill(statistics.centroids[cluster], 0);
-    statistics.deltas[cluster] = 0;
-    for (double[] row : statistics.sumMatrices[cluster]) Arrays.fill(row, 0);
+  static void mergeM(Selection selection, double[][] centers, int[] counts) {
+    if (selection == null) return;
+    for (double[] raw : selection.sequences) {
+      double[] value = MathUtils._zscore(raw);
+      int cluster = nearest(value, centers, counts);
+      for (int u = 0; u < value.length; u++)
+        centers[cluster][u] =
+            (centers[cluster][u] * counts[cluster] + value[u]) / (counts[cluster] + 1);
+      counts[cluster]++;
+    }
   }
 
-  private static double ratio(long start, long end, int a, int b) {
+  private static int nearest(double[] value, double[][] centers, int[] counts) {
+    int best = -1;
+    double distance = Double.POSITIVE_INFINITY;
+    for (int c = 0; c < centers.length; c++)
+      if (counts[c] > 0) {
+        double d = MathUtils._sbd(value, centers[c]);
+        if (d < distance) {
+          best = c;
+          distance = d;
+        }
+      }
+    return best < 0 ? 0 : best;
+  }
+
+  private static long ceil(long value, int l) {
+    return -Math.floorDiv(-value, (long) l) * l;
+  }
+
+  private static double ratio(long start, long end, long a, long b) {
     return Math.max(0L, Math.min(end, b) - Math.max(start, a) + 1) * 1.0 / (end - start + 1);
   }
 }

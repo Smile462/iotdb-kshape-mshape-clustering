@@ -54,6 +54,13 @@ public final class NonEmptyMedoidCandidates {
   // Deliberately retain the reference implementation's whole-page subsequence bounds.
   static List<double[]> sequences(BatchData page, int length) {
     List<double[]> result = new ArrayList<>();
+    if (page.length() < page.getMaxTimestamp() - page.getMinTimestamp() + 1) {
+      for (org.apache.iotdb.tsfile.file.metadata.statistics.util.CompleteSubsequences.Window
+          window :
+              org.apache.iotdb.tsfile.file.metadata.statistics.util.CompleteSubsequences.read(
+                  page, length)) result.add(window.values);
+      return result;
+    }
     for (int i = (int) Math.ceil(page.getMinTimestamp() * 1.0 / length);
         i < Math.floor(page.getMaxTimestamp() * 1.0 / length);
         i++) {

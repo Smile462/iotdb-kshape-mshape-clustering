@@ -255,8 +255,7 @@ public class KshapeExecutor {
         }
       }
 
-      double[] overlapSequence =
-          overlap == null ? null : JournalSelection.boundarySequence(statisticsList, i, l);
+      double[] overlapSequence = null; // Unique overlap fragments are merged once below.
       double[] curHeadExtraPoints = curStatistic.headExtraPoints;
       boolean complementaryFlag = false;
       for (double v : curHeadExtraPoints)
@@ -283,6 +282,8 @@ public class KshapeExecutor {
         }
       }
     }
+
+    OverlapStatistics.mergeK(overlap, centroids, sumMatrices, counts);
 
     for (int i = 0; i < k; i++) {
       centroids[i] = MathUtils._extractShape(sumMatrices[i], centroids[i]);
@@ -420,7 +421,8 @@ public class KshapeExecutor {
         }
       }
 
-      double[] merged = JournalSelection.boundarySequence(statisticsList, i, l);
+      double[] merged =
+          journal.overlap == null ? JournalSelection.boundarySequence(statisticsList, i, l) : null;
       if (merged != null) {
         merged = MathUtils._zscore(merged);
         int nearestIdx = findNearestCentroid(merged, centroids);
@@ -431,6 +433,8 @@ public class KshapeExecutor {
         }
       }
     }
+
+    OverlapStatistics.mergeK(journal.overlap, centroids, sumMatrices, counts);
 
     for (int i = 0; i < k; i++) {
       centroids[i] = MathUtils._extractShape(sumMatrices[i], centroids[i]);

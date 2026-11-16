@@ -652,6 +652,11 @@ public abstract class Statistics<T extends Serializable> {
     long journalBegin = System.nanoTime();
     try {
 
+      if (this.count < this.endTime - this.startTime + 1) {
+        updateSparsePageStatistics();
+        return;
+      }
+
       int n = this.timeWindow.size(); // all points
 
       long seqStartTime = (long) (Math.ceil(this.startTime * 1.0 / l) * l);
@@ -720,6 +725,52 @@ public abstract class Statistics<T extends Serializable> {
     }
   }
 
+  /** Sparse Pages retain only complete original-grid subsequences in the existing payload. */
+  private void updateSparsePageStatistics() {
+    java.util.List<
+            org.apache.iotdb.tsfile.file.metadata.statistics.util.CompleteSubsequences.Window>
+        windows =
+            org.apache.iotdb.tsfile.file.metadata.statistics.util.CompleteSubsequences.read(
+                this.timeWindow, this.valueWindow, l);
+    Arrays.fill(this.idx, -1);
+    Arrays.fill(this.edIdx, -1);
+    // Reserved negative labels identify sparse-window semantics without changing
+    // the persisted layout or the normal dense Page payload.
+    this.idx[this.idx.length - 1] = -2;
+    this.edIdx[this.edIdx.length - 1] = -2;
+    Arrays.fill(this.edCounts, 0);
+    Arrays.fill(this.headExtraPoints, 0);
+    Arrays.fill(this.tailExtraPoints, 0);
+    this.journalGridFragments = true;
+    long first = -Math.floorDiv(-this.startTime, (long) l) * l;
+    double[][] x = new double[windows.size()][l];
+    for (int i = 0; i < windows.size(); i++) {
+      long slot = (windows.get(i).start - first) / l;
+      if (slot < 0 || slot >= this.idx.length - 1)
+        throw new IllegalArgumentException(
+            "Sparse Page span exceeds persisted subsequence-label capacity");
+      x[i] = normalize(windows.get(i).values);
+    }
+    if (!windows.isEmpty()) {
+      KShape shape = new KShape(k, 30);
+      shape.fit(x);
+      for (int c = 0; c < k; c++) this.sumMatrices[c] = shape.getSumMatrices()[c].getArray();
+      this.centroids = shape.getCentroids();
+      this.deltas = shape.getDeltas();
+      for (int c = 0; c < k; c++) if (!Double.isFinite(this.deltas[c])) this.deltas[c] = 0;
+      KMeans medoid = new KMeans.Builder(edK, x).iterations(30).ifPlusInitial(true).build();
+      this.edCentroids = medoid.getCentroids();
+      this.edDeltas = medoid.getDeltas();
+      for (int i = 0; i < windows.size(); i++) {
+        int slot = Math.toIntExact((windows.get(i).start - first) / l);
+        this.idx[slot] = shape.getIdx()[i];
+        this.edIdx[slot] = medoid.getIdx()[i];
+        this.edCounts[this.edIdx[slot]]++;
+      }
+    }
+    this.journalPageStatisticsReady = true;
+  }
+
   private long calTimeInterval() {
     int count = 0;
     long maxFreqInterval = timeWindow.get(1) - timeWindow.get(0);
@@ -786,6 +837,10 @@ public abstract class Statistics<T extends Serializable> {
         return;
       }
 
+      boolean sparsePages = false;
+      for (Statistics page : pageStatisticsList)
+        sparsePages |= page.getCount() < page.getEndTime() - page.getStartTime() + 1;
+
       // 合并时间范围和计数
       this.count = 0;
       for (Statistics pageStat : pageStatisticsList) {
@@ -839,7 +894,8 @@ public abstract class Statistics<T extends Serializable> {
         }
 
         complementaryFlag =
-            curStat.getStartTime() % l != 0
+            !sparsePages
+                && curStat.getStartTime() % l != 0
                 && pageStatisticsList.get(i - 1).getEndTime() + 1 == curStat.getStartTime()
                 && pageStatisticsList.get(i - 1).getStartTime() <= curStat.getStartTime() / l * l
                 && curStat.getEndTime() >= (curStat.getStartTime() / l + 1) * l - 1;
@@ -904,6 +960,10 @@ public abstract class Statistics<T extends Serializable> {
         return;
       }
 
+      boolean sparsePages = false;
+      for (Statistics page : pageStatisticsList)
+        sparsePages |= page.getCount() < page.getEndTime() - page.getStartTime() + 1;
+
       // 合并时间范围和计数
       this.count = 0;
       for (Statistics pageStat : pageStatisticsList) {
@@ -946,7 +1006,8 @@ public abstract class Statistics<T extends Serializable> {
           }
         }
         complementaryFlag =
-            curStat.getStartTime() % l != 0
+            !sparsePages
+                && curStat.getStartTime() % l != 0
                 && pageStatisticsList.get(i - 1).getEndTime() + 1 == curStat.getStartTime()
                 && pageStatisticsList.get(i - 1).getStartTime() <= curStat.getStartTime() / l * l
                 && curStat.getEndTime() >= (curStat.getStartTime() / l + 1) * l - 1;

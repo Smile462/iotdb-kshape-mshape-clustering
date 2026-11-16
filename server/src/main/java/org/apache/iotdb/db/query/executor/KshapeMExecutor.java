@@ -248,8 +248,7 @@ public class KshapeMExecutor {
         }
       }
 
-      double[] overlapSequence =
-          overlap == null ? null : JournalSelection.boundarySequence(statisticsList, i, l);
+      double[] overlapSequence = null; // Unique overlap fragments are merged once below.
       double[] curHeadExtraPoints = curStatistic.headExtraPoints;
       boolean complementaryFlag = false;
       for (double v : curHeadExtraPoints)
@@ -284,6 +283,8 @@ public class KshapeMExecutor {
     System.out.println("Split time cost: " + splitTimeCost);
     System.out.println("Merge time cost: " + mergeTimeCost);
 
+    OverlapStatistics.mergeM(overlap, edCentroids, edCounts);
+
     SeriesReader tmpSeriesReader =
         new SeriesReader(
             seriesPath,
@@ -313,6 +314,10 @@ public class KshapeMExecutor {
           continue;
         }
         BatchData batchData = chunkReader.nextPageData();
+        if (batchData.length() < batchData.getMaxTimestamp() - batchData.getMinTimestamp() + 1) {
+          allSampleSeqs.addAll(NonEmptyMedoidCandidates.sequences(batchData, l));
+          continue;
+        }
         for (int i = (int) (Math.ceil(batchData.getMinTimestamp() * 1.0 / l));
             i < Math.floor(batchData.getMaxTimestamp() * 1.0 / l);
             i++) {
@@ -468,7 +473,8 @@ public class KshapeMExecutor {
         }
       }
 
-      double[] merged = JournalSelection.boundarySequence(statisticsList, i, l);
+      double[] merged =
+          journal.overlap == null ? JournalSelection.boundarySequence(statisticsList, i, l) : null;
       if (merged != null) {
         merged = MathUtils._zscore(merged);
         int nearestIdx = findNearestCentroid(merged, edCentroids);
@@ -481,6 +487,8 @@ public class KshapeMExecutor {
         }
       }
     }
+
+    OverlapStatistics.mergeM(journal.overlap, edCentroids, edCounts);
 
     // 获取 chunkMetadataList 用于采样
     SeriesReader tmpSeriesReader =
@@ -512,6 +520,17 @@ public class KshapeMExecutor {
         BatchData batchData = chunkReader.nextPageData();
         journal.raw += batchData.length();
         journal.candidateRaw += batchData.length();
+        if (batchData.length() < batchData.getMaxTimestamp() - batchData.getMinTimestamp() + 1) {
+          for (org.apache.iotdb.tsfile.file.metadata.statistics.util.CompleteSubsequences.Window
+              window :
+                  org.apache.iotdb.tsfile.file.metadata.statistics.util.CompleteSubsequences.read(
+                      batchData, l)) {
+            allSampleSeqs.add(window.values);
+            journal.candidateCount++;
+            journal.candidateHash = (journal.candidateHash ^ (window.start / l)) * 0x100000001b3L;
+          }
+          continue;
+        }
         for (int i = (int) (Math.ceil(batchData.getMinTimestamp() * 1.0 / l));
             i < Math.floor(batchData.getMaxTimestamp() * 1.0 / l);
             i++) {

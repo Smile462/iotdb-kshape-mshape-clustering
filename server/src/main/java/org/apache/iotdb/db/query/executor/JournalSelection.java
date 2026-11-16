@@ -25,6 +25,7 @@ public final class JournalSelection {
       represented,
       outside;
   long correctedPages;
+  OverlapStatistics.Selection overlap;
   long started = System.nanoTime(), selectionNanos, candidateNanos;
   long candidateHash = 0xcbf29ce484222325L;
   int candidateCount = 0;
@@ -223,7 +224,7 @@ public final class JournalSelection {
       PageCorrector corrector,
       OverlapStatistics.Corrector overlapCorrector)
       throws IOException {
-    OverlapStatistics.Selection overlap =
+    overlap =
         OverlapStatistics.select(path, sensors, type, ctx, data, params, a, b, l, overlapCorrector);
     if (overlap != null) {
       chunks = overlap.chunks;
@@ -232,8 +233,7 @@ public final class JournalSelection {
       raw = overlap.rawPoints;
       boundaryRaw = overlap.rawPoints;
       for (Statistics unit : overlap.units) account(unit);
-      for (int i = 1; i < overlap.units.size(); i++)
-        if (boundarySequence(overlap.units, i, l) != null) represented++;
+      represented += overlap.sequences.size();
       selectionNanos = System.nanoTime() - started;
       return overlap.units;
     }
